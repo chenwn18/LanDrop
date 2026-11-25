@@ -75,6 +75,8 @@ enum class HitKind {
     Nothing,
     TargetField,
     ReceiveField,
+    PeerDropdown,
+    PeerMenuItem,
     PickFiles,
     PickFolder,
     ClearSelection,
@@ -85,7 +87,7 @@ enum class HitKind {
     OpenReceive,
     CancelJob,
     ClearDone,
-    PeerChip,
+    ColumnDivider,
     TransferRow,
 };
 
@@ -100,9 +102,14 @@ struct Hit {
     explicit operator bool() const { return kind != HitKind::Nothing; }
 };
 
-struct PeerChip {
+struct PeerMenuItem {
     Rect rect;
-    int peerIndex = 0;
+    int index = 0;
+};
+
+struct PendingSend {
+    uint64_t jobId = 0;
+    std::vector<std::string> pathKeys;
 };
 
 class LinuxUi {
@@ -129,6 +136,7 @@ private:
     void determineScale();
     void setupAtoms();
     bool createWindow(std::string& error);
+    void createInputContext();
     void createColors();
     void createFonts();
     void createCursors();
@@ -149,11 +157,15 @@ private:
     void drawField(XftDraw* draw, const Rect& rect, const std::string& text,
                    bool focused, const std::string& placeholder,
                    FieldFocus field);
-    void drawPeerChips(XftDraw* draw);
+    void drawPeerSelector(XftDraw* draw);
+    void drawPeerMenu(XftDraw* draw);
     void drawCheckbox(XftDraw* draw);
     void drawDropZone(XftDraw* draw);
     void drawTable(XftDraw* draw);
     void drawProgress(XftDraw* draw);
+    std::string peerSelectorLabel() const;
+    int peerMenuMaxScroll() const;
+    void updateTableColumns();
 
     void fillRect(const Rect& rect, const UiColor& color);
     void fillRounded(const Rect& rect, int radius, const UiColor& color);
@@ -171,6 +183,7 @@ private:
     int baselineFor(const Rect& rect, XftFont* font) const;
 
     void poll();
+    void processPendingSends();
     void applySnapshotChanges();
     void handleAction(Hit hit);
     void setFocus(FieldFocus focus);
@@ -199,9 +212,11 @@ private:
     bool processDropData(const std::string& data);
     void finishDrop(bool success);
     bool validDragSource(Window source) const;
+    bool dragSourceOffersUriList(Window source, bool mayHaveMoreTypes,
+                                 const long* types) const;
     void sendXdndStatus(bool accept);
     void sendXdndFinished(bool accepted);
-    void requestClipboard();
+    void requestClipboard(Time time);
     void insertIntoField(FieldFocus field, const std::string& text);
 
     std::string snapshotSignature() const;
@@ -234,6 +249,8 @@ private:
     Colormap colormap_ = 0;
     GC gc_ = nullptr;
     Window window_ = 0;
+    XIM inputMethod_ = nullptr;
+    XIC inputContext_ = nullptr;
     Pixmap backBuffer_ = 0;
     XftDraw* xftDraw_ = nullptr;
     int windowWidth_ = 0;
@@ -253,6 +270,7 @@ private:
     Cursor cursorArrow_ = 0;
     Cursor cursorHand_ = 0;
     Cursor cursorText_ = 0;
+    Cursor cursorHResize_ = 0;
     Cursor currentCursor_ = 0;
 
     UiColor colorPage_{};
@@ -275,7 +293,10 @@ private:
     UiColor colorDisabledFill_{};
 
     Atom atomWmDelete_ = 0;
+    Atom atomWmProtocols_ = 0;
+    Atom atomWmTakeFocus_ = 0;
     Atom atomNetWmName_ = 0;
+    Atom atomNetWmPid_ = 0;
     Atom atomUtf8String_ = 0;
     Atom atomXdndAware_ = 0;
     Atom atomXdndEnter_ = 0;
@@ -286,6 +307,7 @@ private:
     Atom atomXdndFinished_ = 0;
     Atom atomXdndSelection_ = 0;
     Atom atomXdndActionCopy_ = 0;
+    Atom atomXdndTypeList_ = 0;
     Atom atomTextUriList_ = 0;
     Atom atomIncr_ = 0;
     Atom atomClipboard_ = 0;
@@ -297,7 +319,8 @@ private:
     Rect activityCard_;
     Rect targetLabel_;
     Rect targetField_;
-    Rect peerRow_;
+    Rect peerDropRect_;
+    Rect peerMenuRect_;
     Rect pickFilesButton_;
     Rect pickFolderButton_;
     Rect clearButton_;
@@ -317,7 +340,24 @@ private:
     Rect progressBar_;
     Rect footer_;
 
-    std::vector<PeerChip> peerChips_;
+    std::vector<PeerMenuItem> peerMenuRects_;
+    std::vector<landrop::PeerView> peerMenuItems_;
+    std::string selectedPeerId_;
+    bool peerMenuOpen_ = false;
+    int peerMenuHover_ = -1;
+    int peerMenuScroll_ = 0;
+    int peerMenuVisibleRows_ = 0;
+
+    std::array<double, 6> columnRatios_ = {0.07, 0.20, 0.22, 0.23, 0.10, 0.18};
+    std::array<int, 7> tableColumnEdges_{};
+    std::array<int, 6> tableColumnWidths_{};
+    int tableTotalWidth_ = 0;
+    int columnResizeIndex_ = -1;
+    int columnResizeStartX_ = 0;
+    std::array<double, 6> columnResizeStartRatios_{};
+
+    std::vector<PendingSend> pendingSends_;
+
     Hit hover_;
     Hit pressed_;
     FieldFocus focus_ = FieldFocus::Target;
@@ -354,6 +394,10 @@ private:
 };
 
 namespace {
+
+volatile std::sig_atomic_t g_terminateRequested = 0;
+
+void requestTermination(int) { g_terminateRequested = 1; }
 
 int handleX11Error(Display*, XErrorEvent*) {
     // Drag-and-drop sources routinely disappear while a drag is in flight.
@@ -531,7 +575,10 @@ void LinuxUi::determineScale() {
 
 void LinuxUi::setupAtoms() {
     atomWmDelete_ = XInternAtom(display_, "WM_DELETE_WINDOW", False);
+    atomWmProtocols_ = XInternAtom(display_, "WM_PROTOCOLS", False);
+    atomWmTakeFocus_ = XInternAtom(display_, "WM_TAKE_FOCUS", False);
     atomNetWmName_ = XInternAtom(display_, "_NET_WM_NAME", False);
+    atomNetWmPid_ = XInternAtom(display_, "_NET_WM_PID", False);
     atomUtf8String_ = XInternAtom(display_, "UTF8_STRING", False);
     atomXdndAware_ = XInternAtom(display_, "XdndAware", False);
     atomXdndEnter_ = XInternAtom(display_, "XdndEnter", False);
@@ -542,6 +589,7 @@ void LinuxUi::setupAtoms() {
     atomXdndFinished_ = XInternAtom(display_, "XdndFinished", False);
     atomXdndSelection_ = XInternAtom(display_, "XdndSelection", False);
     atomXdndActionCopy_ = XInternAtom(display_, "XdndActionCopy", False);
+    atomXdndTypeList_ = XInternAtom(display_, "XdndTypeList", False);
     atomTextUriList_ = XInternAtom(display_, "text/uri-list", False);
     atomIncr_ = XInternAtom(display_, "INCR", False);
     atomClipboard_ = XInternAtom(display_, "CLIPBOARD", False);
@@ -578,6 +626,10 @@ bool LinuxUi::createWindow(std::string& error) {
     classHint.res_name = const_cast<char*>("landrop");
     classHint.res_class = const_cast<char*>("LanDrop");
     XSetClassHint(display_, window_, &classHint);
+    const long pid = static_cast<long>(getpid());
+    XChangeProperty(display_, window_, atomNetWmPid_, XA_CARDINAL, 32,
+                    PropModeReplace,
+                    reinterpret_cast<const unsigned char*>(&pid), 1);
 
     XSizeHints hints{};
     hints.flags = PMinSize;
@@ -585,8 +637,8 @@ bool LinuxUi::createWindow(std::string& error) {
     hints.min_height = std::min(scale(kMinHeight), availableHeight);
     XSetWMNormalHints(display_, window_, &hints);
 
-    Atom protocols[] = {atomWmDelete_};
-    XSetWMProtocols(display_, window_, protocols, 1);
+    Atom protocols[] = {atomWmDelete_, atomWmTakeFocus_};
+    XSetWMProtocols(display_, window_, protocols, 2);
     unsigned long xdndVersion = 5;
     XChangeProperty(display_, window_, atomXdndAware_, XA_ATOM, 32,
                     PropModeReplace,
@@ -599,6 +651,24 @@ bool LinuxUi::createWindow(std::string& error) {
     XMapWindow(display_, window_);
     XFlush(display_);
     return true;
+}
+
+void LinuxUi::createInputContext() {
+    // XIM is what lets fcitx/ibus/etc. commit Chinese (and other IME) text
+    // into the directory field. It is optional: without an input method
+    // server we simply fall back to XLookupString in handleKey().
+    inputMethod_ = XOpenIM(display_, nullptr, nullptr, nullptr);
+    if (inputMethod_ == nullptr) {
+        return;
+    }
+    inputContext_ = XCreateIC(
+        inputMethod_, XNInputStyle, XIMPreeditNothing | XIMStatusNothing,
+        XNClientWindow, window_, XNFocusWindow, window_,
+        static_cast<void*>(nullptr));
+    if (inputContext_ == nullptr) {
+        XCloseIM(inputMethod_);
+        inputMethod_ = nullptr;
+    }
 }
 
 void LinuxUi::createColors() {
@@ -660,6 +730,7 @@ void LinuxUi::createCursors() {
     cursorArrow_ = XCreateFontCursor(display_, XC_left_ptr);
     cursorHand_ = XCreateFontCursor(display_, XC_hand2);
     cursorText_ = XCreateFontCursor(display_, XC_xterm);
+    cursorHResize_ = XCreateFontCursor(display_, XC_sb_h_double_arrow);
     currentCursor_ = cursorArrow_;
     XDefineCursor(display_, window_, currentCursor_);
 }
@@ -670,6 +741,8 @@ bool LinuxUi::initialize(std::string& error) {
         return false;
     }
     XSetErrorHandler(handleX11Error);
+    std::signal(SIGINT, requestTermination);
+    std::signal(SIGTERM, requestTermination);
     const int displayFdFlags = fcntl(ConnectionNumber(display_), F_GETFD, 0);
     if (displayFdFlags >= 0) {
         fcntl(ConnectionNumber(display_), F_SETFD,
@@ -687,6 +760,7 @@ bool LinuxUi::initialize(std::string& error) {
     if (!createWindow(error)) {
         return false;
     }
+    createInputContext();
     gc_ = XCreateGC(display_, window_, 0, nullptr);
     if (gc_ == nullptr) {
         error = "无法创建绘图上下文";
@@ -717,6 +791,14 @@ bool LinuxUi::initialize(std::string& error) {
 
 void LinuxUi::cleanup() {
     if (display_ != nullptr) {
+        if (inputContext_ != nullptr) {
+            XDestroyIC(inputContext_);
+            inputContext_ = nullptr;
+        }
+        if (inputMethod_ != nullptr) {
+            XCloseIM(inputMethod_);
+            inputMethod_ = nullptr;
+        }
         if (xftDraw_ != nullptr) {
             XftDrawDestroy(xftDraw_);
             xftDraw_ = nullptr;
@@ -750,6 +832,7 @@ void LinuxUi::cleanup() {
         if (cursorArrow_ != 0) XFreeCursor(display_, cursorArrow_);
         if (cursorHand_ != 0) XFreeCursor(display_, cursorHand_);
         if (cursorText_ != 0) XFreeCursor(display_, cursorText_);
+        if (cursorHResize_ != 0) XFreeCursor(display_, cursorHResize_);
         if (window_ != 0) {
             XDestroyWindow(display_, window_);
             window_ = 0;
@@ -780,13 +863,21 @@ void LinuxUi::computeLayout() {
     const int pad = scale(16);
     const int innerX = sendCard_.x + pad;
     const int innerW = sendCard_.w - pad * 2;
-    const int targetY = cardY + scale(44);
+    const int targetY = cardY + scale(46);
     const int labelWidth = scale(44);
+    const int smallGap = scale(6);
+    const int availableTargetWidth = innerW - labelWidth - smallGap * 2;
+    const int comboWidth =
+        std::max(scale(105),
+                 std::min(scale(200), availableTargetWidth * 42 / 100));
+    const int editWidth =
+        std::max(scale(80), availableTargetWidth - comboWidth);
     targetLabel_ = {innerX, targetY, labelWidth, scale(30)};
-    targetField_ = {innerX + labelWidth + scale(6), targetY,
-                    innerW - labelWidth - scale(6), scale(30)};
-    peerRow_ = {innerX, cardY + scale(78), innerW, scale(22)};
-    const int buttonY = cardY + scale(106);
+    targetField_ = {innerX + labelWidth + smallGap, targetY, editWidth,
+                    scale(30)};
+    peerDropRect_ = {targetField_.right() + smallGap, targetY, comboWidth,
+                     scale(30)};
+    const int buttonY = cardY + scale(86);
     const int buttonH = scale(30);
     pickFilesButton_ = {innerX, buttonY, scale(92), buttonH};
     pickFolderButton_ = {innerX + scale(92) + scale(8), buttonY, scale(106),
@@ -795,7 +886,7 @@ void LinuxUi::computeLayout() {
                     buttonY, scale(54), buttonH};
     sendButton_ = {innerX + innerW - scale(112), buttonY, scale(112),
                    buttonH};
-    dropZone_ = {innerX, cardY + scale(144), innerW, scale(54)};
+    dropZone_ = {innerX, cardY + scale(124), innerW, scale(76)};
 
     const int recvX = receiveCard_.x + pad;
     const int recvW = receiveCard_.w - pad * 2;
@@ -833,6 +924,7 @@ void LinuxUi::computeLayout() {
     rowHeight_ = scale(30);
     visibleRows_ = std::max(0, tableBody_.h / rowHeight_);
     footer_ = {0, height - scale(22), width, scale(22)};
+    updateTableColumns();
     clampScroll();
 }
 
@@ -840,6 +932,50 @@ void LinuxUi::clampScroll() {
     const int total = static_cast<int>(snapshot_.transfers.size());
     const int maxOffset = std::max(0, total - visibleRows_);
     scrollOffset_ = std::clamp(scrollOffset_, 0, maxOffset);
+}
+
+void LinuxUi::updateTableColumns() {
+    const int totalWidth = std::max(scale(420), tableHeader_.w - scale(18));
+    tableTotalWidth_ = totalWidth;
+    const int minWidth = scale(40);
+    double sum = 0.0;
+    for (double ratio : columnRatios_) {
+        sum += ratio;
+    }
+    if (!(sum > 0.0)) {
+        columnRatios_ = {1.0, 1.0, 1.0, 1.0, 1.0, 1.0};
+        sum = 6.0;
+    }
+    int widths[6]{};
+    int used = 0;
+    for (int i = 0; i < 5; ++i) {
+        widths[i] = std::max(
+            minWidth,
+            static_cast<int>(std::lround(
+                static_cast<double>(totalWidth) * columnRatios_[i] / sum)));
+        used += widths[i];
+    }
+    widths[5] = std::max(0, totalWidth - used);
+    while (widths[5] < minWidth) {
+        int widest = 0;
+        for (int i = 1; i < 5; ++i) {
+            if (widths[i] > widths[widest]) {
+                widest = i;
+            }
+        }
+        if (widths[widest] <= minWidth) {
+            break;
+        }
+        --widths[widest];
+        ++widths[5];
+    }
+    int edge = tableHeader_.x + scale(4);
+    tableColumnEdges_[0] = edge;
+    for (int i = 0; i < 6; ++i) {
+        tableColumnWidths_[i] = widths[i];
+        edge += widths[i];
+        tableColumnEdges_[i + 1] = edge;
+    }
 }
 
 std::string LinuxUi::snapshotSignature() const {
@@ -879,6 +1015,7 @@ std::string LinuxUi::snapshotSignature() const {
 
 void LinuxUi::poll() {
     snapshot_ = controller_.snapshot();
+    processPendingSends();
     const auto logs = controller_.logsAfter(lastLogSequence_);
     for (const auto& entry : logs) {
         lastLogSequence_ = std::max(lastLogSequence_, entry.sequence);
@@ -919,6 +1056,56 @@ void LinuxUi::poll() {
     if (!toast_.empty() &&
         std::chrono::steady_clock::now() > toastUntil_) {
         toast_.clear();
+        dirty_ = true;
+    }
+}
+
+void LinuxUi::processPendingSends() {
+    if (pendingSends_.empty()) {
+        return;
+    }
+    bool selectionChanged = false;
+    for (auto it = pendingSends_.begin(); it != pendingSends_.end();) {
+        const landrop::TransferView* job = nullptr;
+        for (const auto& candidate : snapshot_.transfers) {
+            if (candidate.id == it->jobId) {
+                job = &candidate;
+                break;
+            }
+        }
+        if (job == nullptr) {
+            // The user cleared the finished job before this poll; keep the
+            // selection rather than guessing the outcome.
+            it = pendingSends_.erase(it);
+            continue;
+        }
+        if (job->state == landrop::TransferState::Completed) {
+            const std::set<std::string> sentKeys(it->pathKeys.begin(),
+                                                 it->pathKeys.end());
+            const std::size_t before = selectedPaths_.size();
+            selectedPaths_.erase(
+                std::remove_if(
+                    selectedPaths_.begin(), selectedPaths_.end(),
+                    [&](const fs::path& path) {
+                        return sentKeys.count(
+                                   landrop::pathCollisionKey(path)) != 0;
+                    }),
+                selectedPaths_.end());
+            if (selectedPaths_.size() != before) {
+                selectionChanged = true;
+            }
+            it = pendingSends_.erase(it);
+            continue;
+        }
+        if (job->state == landrop::TransferState::Failed ||
+            job->state == landrop::TransferState::Canceled) {
+            // Keep the selection so the user can retry after a failure.
+            it = pendingSends_.erase(it);
+            continue;
+        }
+        ++it;
+    }
+    if (selectionChanged) {
         dirty_ = true;
     }
 }
@@ -1238,60 +1425,130 @@ void LinuxUi::drawField(XftDraw* draw, const Rect& rect,
     }
 }
 
-void LinuxUi::drawPeerChips(XftDraw* draw) {
-    peerChips_.clear();
+std::string LinuxUi::peerSelectorLabel() const {
+    if (!snapshot_.discoveryActive) {
+        return "未启用设备发现";
+    }
     if (snapshot_.peers.empty()) {
-        const std::string message = snapshot_.discoveryActive
-                                        ? "等待局域网设备发现…"
-                                        : "未启用设备发现，请手动输入 IP";
-        drawTextInRect(draw, fontSmall_, colorMuted_, peerRow_, message,
-                       false);
+        return "未发现其他设备";
+    }
+    if (!selectedPeerId_.empty()) {
+        for (const auto& peer : snapshot_.peers) {
+            if (peer.id != selectedPeerId_) {
+                continue;
+            }
+            std::string address = peer.ip;
+            if (peer.port != landrop::kDefaultTcpPort) {
+                address += ":" + std::to_string(peer.port);
+            }
+            if (targetText_ == address) {
+                return peer.name.empty()
+                           ? address
+                           : peer.name + "  ·  " + address;
+            }
+            break;
+        }
+    }
+    return "选择发现的设备…";
+}
+
+int LinuxUi::peerMenuMaxScroll() const {
+    return std::max(0, static_cast<int>(peerMenuItems_.size()) -
+                           peerMenuVisibleRows_);
+}
+
+void LinuxUi::drawPeerSelector(XftDraw* draw) {
+    const bool canDiscover = snapshot_.discoveryActive;
+    const bool hasPeers = canDiscover && !snapshot_.peers.empty();
+    const bool hovered = hover_.kind == HitKind::PeerDropdown;
+    fillRounded(peerDropRect_, scale(6), colorField_);
+    strokeRounded(peerDropRect_, scale(6),
+                  (peerMenuOpen_ || hovered) ? colorAccent_ : colorBorder_);
+    const int pad = scale(8);
+    Rect textRect{peerDropRect_.x + pad, peerDropRect_.y,
+                  peerDropRect_.w - pad * 2 - scale(18), peerDropRect_.h};
+    drawTextInRect(draw, fontBody_, hasPeers ? colorText_ : colorMuted_,
+                   textRect, peerSelectorLabel(), false);
+
+    const int cx = peerDropRect_.right() - scale(12);
+    const int cy = peerDropRect_.y + peerDropRect_.h / 2;
+    const int arrow = scale(4);
+    XSetForeground(display_, gc_,
+                   (hasPeers ? colorMuted_ : colorDisabled_).pixel);
+    XSetLineAttributes(display_, gc_, std::max(1, scale(1)), LineSolid,
+                       CapRound, JoinRound);
+    XDrawLine(display_, backBuffer_, gc_, cx - arrow, cy - arrow / 2, cx,
+              cy + arrow / 2);
+    XDrawLine(display_, backBuffer_, gc_, cx, cy + arrow / 2, cx + arrow,
+              cy - arrow / 2);
+    XSetLineAttributes(display_, gc_, 1, LineSolid, CapButt, JoinMiter);
+}
+
+void LinuxUi::drawPeerMenu(XftDraw* draw) {
+    peerMenuRects_.clear();
+    peerMenuVisibleRows_ = 0;
+    if (!peerMenuOpen_ || peerMenuItems_.empty()) {
         return;
     }
-    Rect available = peerRow_;
-    const std::string prefix = "发现设备";
-    const int prefixW = textWidth(fontSmall_, prefix) + scale(8);
-    drawTextInRect(draw, fontSmall_, colorMuted_,
-                   {available.x, available.y, prefixW, available.h}, prefix,
-                   false);
-    available.x += prefixW;
-    available.w -= prefixW;
-    int shown = 0;
-    for (std::size_t i = 0; i < snapshot_.peers.size(); ++i) {
-        if (available.w < scale(80)) break;
-        const auto& peer = snapshot_.peers[i];
-        std::string label = peer.name.empty() ? peer.ip : peer.name;
-        if (label.empty()) label = peer.ip;
-        std::string secondary = peer.ip;
-        if (peer.port != landrop::kDefaultTcpPort) {
-            secondary += ":" + std::to_string(peer.port);
-        }
-        const int maxText = scale(150);
-        label = ellipsize(fontSmall_, label, maxText);
-        const int chipW =
-            std::min(available.w, textWidth(fontSmall_, label) + scale(18));
-        if (chipW < scale(50)) break;
-        Rect chip{available.x, available.y, chipW, available.h};
-        const bool hovered = hover_.kind == HitKind::PeerChip &&
-                            hover_.index == static_cast<int>(i);
-        fillRounded(chip, scale(6),
-                    hovered ? colorAccentTint_ : colorField_);
-        strokeRounded(chip, scale(6),
-                      hovered ? colorAccentBorder_ : colorBorder_);
-        Rect labelRect{chip.x + scale(9), chip.y,
-                       chip.w - scale(14), chip.h};
-        drawTextInRect(draw, fontSmall_, colorText_, labelRect,
-                       ellipsize(fontSmall_, label, labelRect.w), false);
-        peerChips_.push_back({chip, static_cast<int>(i)});
-        available.x += chipW + scale(6);
-        available.w -= chipW + scale(6);
-        ++shown;
-        if (shown >= 3) break;
+    const int rowHeight = scale(26);
+    const int pad = scale(4);
+    const std::size_t maxRows = 8;
+    peerMenuVisibleRows_ = static_cast<int>(
+        std::min<std::size_t>(peerMenuItems_.size(), maxRows));
+
+    int menuWidth = std::max(peerDropRect_.w, scale(240));
+    menuWidth = std::min(menuWidth, windowWidth_ - scale(8));
+    int menuX = peerDropRect_.x;
+    if (menuX + menuWidth > windowWidth_ - scale(8)) {
+        menuX = windowWidth_ - scale(8) - menuWidth;
     }
-    if (shown < static_cast<int>(snapshot_.peers.size())) {
-        const std::string more =
-            "+" + std::to_string(snapshot_.peers.size() - shown);
-        drawTextInRect(draw, fontSmall_, colorMuted_, available, more, false);
+    const int menuHeight = peerMenuVisibleRows_ * rowHeight + pad * 2;
+    int menuY = peerDropRect_.bottom() + scale(2);
+    if (menuY + menuHeight > windowHeight_ - scale(6)) {
+        menuY = std::max(scale(6),
+                         peerDropRect_.y - menuHeight - scale(2));
+    }
+    peerMenuRect_ = {menuX, menuY, menuWidth, menuHeight};
+    fillRounded({menuX + 1, menuY + 2, menuWidth, menuHeight}, scale(8),
+                colorShadow_);
+    fillRounded(peerMenuRect_, scale(8), colorCard_);
+    strokeRounded(peerMenuRect_, scale(8), colorBorder_);
+
+    const int maxScroll = peerMenuMaxScroll();
+    peerMenuScroll_ = std::clamp(peerMenuScroll_, 0, maxScroll);
+    for (int row = 0; row < peerMenuVisibleRows_; ++row) {
+        const int index = peerMenuScroll_ + row;
+        if (index >= static_cast<int>(peerMenuItems_.size())) {
+            break;
+        }
+        const auto& peer = peerMenuItems_[static_cast<std::size_t>(index)];
+        Rect rowRect{menuX + pad, menuY + pad + row * rowHeight,
+                     menuWidth - pad * 2, rowHeight};
+        if (peerMenuHover_ == index) {
+            fillRounded(rowRect, scale(5), colorAccentTint_);
+        }
+        std::string label = peer.name.empty() ? "未知设备" : peer.name;
+        std::string address = peer.ip;
+        if (peer.port != landrop::kDefaultTcpPort) {
+            address += ":" + std::to_string(peer.port);
+        }
+        label += "  ·  " + address;
+        Rect labelRect{rowRect.x + scale(8), rowRect.y,
+                       rowRect.w - scale(16), rowRect.h};
+        drawTextInRect(draw, fontBody_, colorText_, labelRect, label, false);
+        peerMenuRects_.push_back({rowRect, index});
+    }
+    if (maxScroll > 0) {
+        const int trackW = scale(4);
+        Rect track{peerMenuRect_.right() - scale(8),
+                   peerMenuRect_.y + scale(6), trackW,
+                   peerMenuRect_.h - scale(12)};
+        fillRounded(track, trackW / 2, colorBorder_);
+        const int thumbH = std::max(scale(20), track.h / 3);
+        const int travel = std::max(1, track.h - thumbH);
+        const int thumbY = track.y + travel * peerMenuScroll_ / maxScroll;
+        fillRounded({track.x, thumbY, trackW, thumbH}, trackW / 2,
+                    colorMuted_);
     }
 }
 
@@ -1310,20 +1567,27 @@ void LinuxUi::drawDropZone(XftDraw* draw) {
     titleRect.y += scale(7);
     titleRect.h = dropZone_.h * 52 / 100;
     std::string title;
-    if (dragActive_) {
+    if (dragActive_ && !dropAccepted_) {
+        title = "不支持拖入的内容";
+    } else if (dragActive_) {
         title = "松开以添加文件";
     } else if (hasSelection) {
         title = "已选择 " + std::to_string(selectedPaths_.size()) + " 项";
     } else {
         title = "将文件或文件夹拖到这里";
     }
-    drawTextInRect(draw, fontBold_,
-                   active ? colorAccent_ : colorText_, titleRect, title, true);
+    const UiColor& titleColor =
+        (dragActive_ && !dropAccepted_)
+            ? colorDanger_
+            : (active ? colorAccent_ : colorText_);
+    drawTextInRect(draw, fontBold_, titleColor, titleRect, title, true);
     Rect subtitleRect = dropZone_;
     subtitleRect.y = titleRect.bottom() - scale(2);
     subtitleRect.h = dropZone_.bottom() - subtitleRect.y - scale(4);
     std::string subtitle;
-    if (hasSelection) {
+    if (dragActive_ && !dropAccepted_) {
+        subtitle = "请拖入文件或文件夹";
+    } else if (hasSelection) {
         for (std::size_t i = 0;
              i < selectedPaths_.size() && i < 3; ++i) {
             if (i != 0) subtitle += "  ·  ";
@@ -1376,7 +1640,7 @@ void LinuxUi::drawSendCard(XftDraw* draw) {
     drawField(draw, targetField_, targetText_,
               focus_ == FieldFocus::Target, "192.168.1.5 或 IP:端口",
               FieldFocus::Target);
-    drawPeerChips(draw);
+    drawPeerSelector(draw);
 
     const bool hasSelection = !selectedPaths_.empty();
     drawButton(draw, pickFilesButton_, "选择文件", false, true,
@@ -1485,28 +1749,28 @@ bool LinuxUi::selectedJobCancelable() const {
 }
 
 void LinuxUi::drawTable(XftDraw* draw) {
+    updateTableColumns();
     fillRect(tableHeader_, colorField_);
     drawLine(tableHeader_.x, tableHeader_.y, tableHeader_.x,
              tableHeader_.bottom(), colorBorder_);
     drawLine(tableHeader_.x, tableHeader_.bottom() - 1, tableHeader_.right(),
              tableHeader_.bottom() - 1, colorBorder_);
 
-    const int totalWidth = std::max(scale(420), tableHeader_.w - scale(18));
-    const int widths[6] = {totalWidth * 7 / 100, totalWidth * 20 / 100,
-                           totalWidth * 22 / 100, totalWidth * 23 / 100,
-                           totalWidth * 10 / 100, 0};
-    int lastWidth = totalWidth - widths[0] - widths[1] - widths[2] -
-                    widths[3] - widths[4];
     const std::string headers[6] = {"方向", "设备", "当前项目",
                                     "进度", "速度", "状态"};
-    int columnX = tableHeader_.x + scale(4);
-    std::array<int, 6> columnWidths = {
-        widths[0], widths[1], widths[2], widths[3], widths[4], lastWidth};
     for (int i = 0; i < 6; ++i) {
-        Rect cell{columnX, tableHeader_.y, columnWidths[i] - scale(6),
+        Rect cell{tableColumnEdges_[i], tableHeader_.y,
+                  std::max(0, tableColumnWidths_[i] - scale(6)),
                   tableHeader_.h};
         drawTextInRect(draw, fontSmall_, colorMuted_, cell, headers[i], false);
-        columnX += columnWidths[i];
+    }
+    for (int i = 1; i < 6; ++i) {
+        const bool active =
+            (hover_.kind == HitKind::ColumnDivider && hover_.index == i - 1) ||
+            columnResizeIndex_ == i - 1;
+        drawLine(tableColumnEdges_[i], tableHeader_.y + scale(5),
+                 tableColumnEdges_[i], tableHeader_.bottom() - scale(5),
+                 active ? colorAccent_ : colorBorder_);
     }
 
     if (snapshot_.transfers.empty()) {
@@ -1539,13 +1803,12 @@ void LinuxUi::drawTable(XftDraw* draw) {
         } else if (job.state == landrop::TransferState::Canceled) {
             textColor = colorMuted_;
         }
-        columnX = rowRect.x + scale(4);
         for (int column = 0; column < 6; ++column) {
-            Rect cell{columnX, rowRect.y, columnWidths[column] - scale(6),
+            Rect cell{tableColumnEdges_[column], rowRect.y,
+                      std::max(0, tableColumnWidths_[column] - scale(6)),
                       rowRect.h};
             drawTextInRect(draw, fontBody_, textColor, cell, cells[column],
                            false);
-            columnX += columnWidths[column];
         }
     }
     if (static_cast<int>(snapshot_.transfers.size()) > visibleRows_) {
@@ -1690,6 +1953,9 @@ void LinuxUi::renderToPixmap() {
     drawReceiveCard(xftDraw_);
     drawActivityCard(xftDraw_);
     drawFooter(xftDraw_);
+    // The discovered-device menu is an overlay: draw it last so it covers the
+    // drop zone and activity card.
+    drawPeerMenu(xftDraw_);
     XCopyArea(display_, backBuffer_, window_, gc_, 0, 0,
               static_cast<unsigned int>(windowWidth_),
               static_cast<unsigned int>(windowHeight_), 0, 0);
@@ -1702,6 +1968,17 @@ void LinuxUi::render() {
 }
 
 Hit LinuxUi::hitTest(int x, int y) const {
+    if (peerMenuOpen_) {
+        for (const auto& item : peerMenuRects_) {
+            if (item.rect.contains(x, y)) {
+                return {HitKind::PeerMenuItem, item.index};
+            }
+        }
+        if (peerMenuRect_.contains(x, y)) {
+            return {};
+        }
+    }
+    if (peerDropRect_.contains(x, y)) return {HitKind::PeerDropdown, -1};
     if (targetField_.contains(x, y)) return {HitKind::TargetField, -1};
     if (receiveField_.contains(x, y)) return {HitKind::ReceiveField, -1};
     if (pickFilesButton_.contains(x, y)) return {HitKind::PickFiles, -1};
@@ -1721,9 +1998,11 @@ Hit LinuxUi::hitTest(int x, int y) const {
         return {HitKind::CancelJob, -1};
     if (clearDoneButton_.contains(x, y))
         return {HitKind::ClearDone, -1};
-    for (const auto& chip : peerChips_) {
-        if (chip.rect.contains(x, y)) {
-            return {HitKind::PeerChip, chip.peerIndex};
+    if (y >= tableHeader_.y && y < tableHeader_.bottom()) {
+        for (int i = 0; i < 5; ++i) {
+            if (std::abs(x - tableColumnEdges_[i + 1]) <= scale(3)) {
+                return {HitKind::ColumnDivider, i};
+            }
         }
     }
     if (tableBody_.contains(x, y) && !snapshot_.transfers.empty()) {
@@ -1745,6 +2024,8 @@ void LinuxUi::updateHover(int x, int y, bool updateCursor) {
         case HitKind::ReceiveField:
             desired = cursorText_;
             break;
+        case HitKind::PeerDropdown:
+        case HitKind::PeerMenuItem:
         case HitKind::PickFiles:
         case HitKind::PickFolder:
         case HitKind::ClearSelection:
@@ -1755,8 +2036,10 @@ void LinuxUi::updateHover(int x, int y, bool updateCursor) {
         case HitKind::OpenReceive:
         case HitKind::CancelJob:
         case HitKind::ClearDone:
-        case HitKind::PeerChip:
             desired = cursorHand_;
+            break;
+        case HitKind::ColumnDivider:
+            desired = cursorHResize_;
             break;
         default:
             break;
@@ -1764,6 +2047,12 @@ void LinuxUi::updateHover(int x, int y, bool updateCursor) {
     if (updateCursor && desired != 0 && desired != currentCursor_) {
         currentCursor_ = desired;
         XDefineCursor(display_, window_, currentCursor_);
+    }
+    const int peerHover =
+        (peerMenuOpen_ && hit.kind == HitKind::PeerMenuItem) ? hit.index : -1;
+    if (peerHover != peerMenuHover_) {
+        peerMenuHover_ = peerHover;
+        dirty_ = true;
     }
     if (hit != hover_) {
         hover_ = hit;
@@ -1877,9 +2166,16 @@ void LinuxUi::sendCurrentSelection() {
         controller_.send(targetText_, selectedPaths_, error);
     if (id == 0) {
         setToast(error);
-    } else {
-        setToast("已加入发送队列");
+        return;
     }
+    PendingSend pending;
+    pending.jobId = id;
+    pending.pathKeys.reserve(selectedPaths_.size());
+    for (const auto& path : selectedPaths_) {
+        pending.pathKeys.push_back(landrop::pathCollisionKey(path));
+    }
+    pendingSends_.push_back(std::move(pending));
+    setToast("已加入发送队列");
 }
 
 void LinuxUi::handleAction(Hit hit) {
@@ -1955,19 +2251,39 @@ void LinuxUi::handleAction(Hit hit) {
             selectedJobId_ = 0;
             poll();
             break;
-        case HitKind::PeerChip:
+        case HitKind::PeerDropdown:
+            if (snapshot_.discoveryActive && !snapshot_.peers.empty()) {
+                if (peerMenuOpen_) {
+                    peerMenuOpen_ = false;
+                    peerMenuHover_ = -1;
+                } else {
+                    peerMenuItems_ = snapshot_.peers;
+                    peerMenuScroll_ = 0;
+                    peerMenuHover_ = -1;
+                    peerMenuOpen_ = true;
+                }
+                dirty_ = true;
+            }
+            break;
+        case HitKind::PeerMenuItem:
             if (hit.index >= 0 &&
                 static_cast<std::size_t>(hit.index) <
-                    snapshot_.peers.size()) {
-                const auto& peer = snapshot_.peers[hit.index];
+                    peerMenuItems_.size()) {
+                const auto& peer =
+                    peerMenuItems_[static_cast<std::size_t>(hit.index)];
                 targetText_ = peer.ip;
                 if (peer.port != landrop::kDefaultTcpPort) {
                     targetText_ += ":" + std::to_string(peer.port);
                 }
                 targetCursor_ = targetText_.size();
+                selectedPeerId_ = peer.id;
+                peerMenuOpen_ = false;
+                peerMenuHover_ = -1;
                 setFocus(FieldFocus::Target);
                 dirty_ = true;
             }
+            break;
+        case HitKind::ColumnDivider:
             break;
         case HitKind::TransferRow:
             if (hit.index >= 0 &&
@@ -2012,13 +2328,44 @@ void LinuxUi::insertIntoField(FieldFocus field, const std::string& text) {
 }
 
 void LinuxUi::handleKey(XKeyEvent& event) {
-    char buffer[32]{};
-    KeySym symbol = 0;
-    const int length = XLookupString(&event, buffer, sizeof(buffer), &symbol,
-                                     nullptr);
+    KeySym symbol = NoSymbol;
+    std::string typedText;
+    bool hasText = false;
+    if (inputContext_ != nullptr) {
+        std::vector<char> buffer(64);
+        for (;;) {
+            Status status = 0;
+            const int length = Xutf8LookupString(
+                inputContext_, &event, buffer.data(),
+                static_cast<int>(buffer.size()), &symbol, &status);
+            if (status == XBufferOverflow && length > 0) {
+                buffer.resize(static_cast<std::size_t>(length) + 1);
+                continue;
+            }
+            if (length > 0) {
+                typedText.assign(buffer.data(),
+                                 static_cast<std::size_t>(length));
+                hasText = true;
+            }
+            break;
+        }
+    } else {
+        char fallback[64]{};
+        const int length = XLookupString(&event, fallback, sizeof(fallback),
+                                         &symbol, nullptr);
+        if (length > 0) {
+            typedText.assign(fallback, static_cast<std::size_t>(length));
+            hasText = true;
+        }
+    }
+    // When an input method consumes the key down to committed text only,
+    // Xutf8LookupString reports NoSymbol. Keysym-based shortcuts and
+    // navigation keys still need the physical keysym.
+    const KeySym keySymbol =
+        symbol != NoSymbol ? symbol : XLookupKeysym(&event, 0);
     const bool control = (event.state & ControlMask) != 0;
 
-    if (symbol == XK_Tab) {
+    if (keySymbol == XK_Tab || keySymbol == XK_ISO_Left_Tab) {
         const bool reverse = (event.state & ShiftMask) != 0;
         if (reverse) {
             if (focus_ == FieldFocus::Target) {
@@ -2038,7 +2385,11 @@ void LinuxUi::handleKey(XKeyEvent& event) {
         dirty_ = true;
         return;
     }
-    if (symbol == XK_Escape) {
+    if (keySymbol == XK_Escape) {
+        if (peerMenuOpen_) {
+            peerMenuOpen_ = false;
+            peerMenuHover_ = -1;
+        }
         setFocus(FieldFocus::NoField);
         dirty_ = true;
         return;
@@ -2046,12 +2397,12 @@ void LinuxUi::handleKey(XKeyEvent& event) {
     if (focus_ == FieldFocus::NoField) {
         return;
     }
-    if (control && (symbol == XK_v || symbol == XK_V)) {
+    if (control && (keySymbol == XK_v || keySymbol == XK_V)) {
         clipboardFocus_ = focus_;
-        requestClipboard();
+        requestClipboard(event.time);
         return;
     }
-    if (symbol == XK_Return || symbol == XK_KP_Enter) {
+    if (keySymbol == XK_Return || keySymbol == XK_KP_Enter) {
         if (focus_ == FieldFocus::Receive) {
             applyReceivePath(true);
         } else {
@@ -2059,34 +2410,34 @@ void LinuxUi::handleKey(XKeyEvent& event) {
         }
         return;
     }
-    if (symbol == XK_BackSpace || symbol == XK_Delete) {
+    if (keySymbol == XK_BackSpace || keySymbol == XK_Delete) {
         std::string& text = focus_ == FieldFocus::Target ? targetText_
                                                          : receiveText_;
         std::size_t& cursor = focus_ == FieldFocus::Target ? targetCursor_
                                                            : receiveCursor_;
-        if (symbol == XK_BackSpace && cursor > 0) {
+        if (keySymbol == XK_BackSpace && cursor > 0) {
             const std::size_t previous = previousUtf8Boundary(text, cursor);
             text.erase(previous, cursor - previous);
             cursor = previous;
             dirty_ = true;
-        } else if (symbol == XK_Delete && cursor < text.size()) {
+        } else if (keySymbol == XK_Delete && cursor < text.size()) {
             const std::size_t next = nextUtf8Boundary(text, cursor);
             text.erase(cursor, next - cursor);
             dirty_ = true;
         }
         return;
     }
-    if (symbol == XK_Left || symbol == XK_Right ||
-        symbol == XK_Home || symbol == XK_End) {
+    if (keySymbol == XK_Left || keySymbol == XK_Right ||
+        keySymbol == XK_Home || keySymbol == XK_End) {
         std::string& text = focus_ == FieldFocus::Target ? targetText_
                                                          : receiveText_;
         std::size_t& cursor = focus_ == FieldFocus::Target ? targetCursor_
                                                            : receiveCursor_;
-        if (symbol == XK_Left) {
+        if (keySymbol == XK_Left) {
             cursor = previousUtf8Boundary(text, cursor);
-        } else if (symbol == XK_Right) {
+        } else if (keySymbol == XK_Right) {
             cursor = nextUtf8Boundary(text, cursor);
-        } else if (symbol == XK_Home) {
+        } else if (keySymbol == XK_Home) {
             cursor = 0;
         } else {
             cursor = text.size();
@@ -2094,11 +2445,10 @@ void LinuxUi::handleKey(XKeyEvent& event) {
         dirty_ = true;
         return;
     }
-    if (!control && (event.state & Mod1Mask) == 0 && length > 0) {
+    if (!control && (event.state & Mod1Mask) == 0 && hasText) {
         std::string typed;
         bool printable = true;
-        for (int i = 0; i < length; ++i) {
-            const unsigned char c = static_cast<unsigned char>(buffer[i]);
+        for (unsigned char c : typedText) {
             if (c < 0x20 || c == 0x7f) {
                 printable = false;
                 break;
@@ -2113,6 +2463,13 @@ void LinuxUi::handleKey(XKeyEvent& event) {
 
 void LinuxUi::handleButtonPress(XButtonEvent& event) {
     if (event.button == Button4 || event.button == Button5) {
+        if (peerMenuOpen_ && peerMenuRect_.contains(event.x, event.y)) {
+            const int direction = event.button == Button4 ? -1 : 1;
+            peerMenuScroll_ = std::clamp(peerMenuScroll_ + direction, 0,
+                                         peerMenuMaxScroll());
+            dirty_ = true;
+            return;
+        }
         if (tableBody_.contains(event.x, event.y)) {
             const int direction = event.button == Button4 ? -3 : 3;
             scrollOffset_ = std::max(0, scrollOffset_ + direction);
@@ -2125,6 +2482,22 @@ void LinuxUi::handleButtonPress(XButtonEvent& event) {
         return;
     }
     const Hit hit = hitTest(event.x, event.y);
+    if (peerMenuOpen_ && hit.kind != HitKind::PeerMenuItem &&
+        hit.kind != HitKind::PeerDropdown &&
+        !peerMenuRect_.contains(event.x, event.y)) {
+        peerMenuOpen_ = false;
+        peerMenuHover_ = -1;
+        dirty_ = true;
+    }
+    if (hit.kind == HitKind::ColumnDivider) {
+        columnResizeIndex_ = hit.index;
+        columnResizeStartX_ = event.x;
+        columnResizeStartRatios_ = columnRatios_;
+        pressed_ = {};
+        setFocus(FieldFocus::NoField);
+        dirty_ = true;
+        return;
+    }
     if (hit.kind == HitKind::TargetField) {
         setFocus(FieldFocus::Target);
         targetCursor_ = targetText_.size();
@@ -2156,6 +2529,12 @@ void LinuxUi::handleButtonRelease(XButtonEvent& event) {
     if (event.button != Button1) {
         return;
     }
+    if (columnResizeIndex_ >= 0) {
+        columnResizeIndex_ = -1;
+        updateHover(event.x, event.y, true);
+        dirty_ = true;
+        return;
+    }
     const Hit hit = hitTest(event.x, event.y);
     if (pressed_ == hit && pressed_) {
         handleAction(hit);
@@ -2166,13 +2545,34 @@ void LinuxUi::handleButtonRelease(XButtonEvent& event) {
 }
 
 void LinuxUi::handleMotion(XMotionEvent& event) {
+    if (columnResizeIndex_ >= 0) {
+        const int index = columnResizeIndex_;
+        const int total = std::max(1, tableTotalWidth_);
+        const double pair = columnResizeStartRatios_[index] +
+                            columnResizeStartRatios_[index + 1];
+        const double minRatio = std::min(
+            pair * 0.5, static_cast<double>(scale(40)) / total);
+        const double delta =
+            static_cast<double>(event.x - columnResizeStartX_) / total;
+        const double left = std::clamp(
+            columnResizeStartRatios_[index] + delta, minRatio,
+            pair - minRatio);
+        columnRatios_[index] = left;
+        columnRatios_[index + 1] = pair - left;
+        updateTableColumns();
+        dirty_ = true;
+        return;
+    }
     updateHover(event.x, event.y, true);
 }
 
-void LinuxUi::requestClipboard() {
+void LinuxUi::requestClipboard(Time time) {
     selectionPurpose_ = SelectionPurpose::Clipboard;
+    // Use the triggering key event's timestamp. Some clipboard managers
+    // reject CurrentTime for ICCCM-compliant selection requests.
     XConvertSelection(display_, atomClipboard_, atomUtf8String_,
-                      atomClipboardProperty_, window_, CurrentTime);
+                      atomClipboardProperty_, window_,
+                      time != 0 ? time : CurrentTime);
     XFlush(display_);
 }
 
@@ -2182,6 +2582,43 @@ bool LinuxUi::validDragSource(Window source) const {
     }
     XWindowAttributes attributes{};
     return XGetWindowAttributes(display_, source, &attributes) != 0;
+}
+
+bool LinuxUi::dragSourceOffersUriList(Window source, bool mayHaveMoreTypes,
+                                      const long* types) const {
+    for (int i = 0; i < 3; ++i) {
+        if (types[i] != 0 &&
+            static_cast<Atom>(types[i]) == atomTextUriList_) {
+            return true;
+        }
+    }
+    if (!mayHaveMoreTypes || source == 0) {
+        return false;
+    }
+    Atom type = None;
+    int format = 0;
+    unsigned long count = 0;
+    unsigned long after = 0;
+    unsigned char* value = nullptr;
+    if (XGetWindowProperty(display_, source, atomXdndTypeList_, 0, 128, False,
+                           XA_ATOM, &type, &format, &count, &after,
+                           &value) != Success ||
+        value == nullptr || format != 32) {
+        if (value != nullptr) {
+            XFree(value);
+        }
+        return false;
+    }
+    bool offers = false;
+    const auto* atoms = reinterpret_cast<const long*>(value);
+    for (unsigned long i = 0; i < count; ++i) {
+        if (static_cast<Atom>(atoms[i]) == atomTextUriList_) {
+            offers = true;
+            break;
+        }
+    }
+    XFree(value);
+    return offers;
 }
 
 void LinuxUi::sendXdndStatus(bool accept) {
@@ -2334,6 +2771,12 @@ void LinuxUi::handleClientMessage(XClientMessageEvent& event) {
         dragSource_ = source;
         dragVersion_ = static_cast<int>((event.data.l[1] >> 24) & 0xff);
         dropAccepted_ = true;
+        if (dragVersion_ >= 1) {
+            const long types[3] = {event.data.l[2], event.data.l[3],
+                                   event.data.l[4]};
+            dropAccepted_ = dragSourceOffersUriList(
+                source, (event.data.l[1] & 1) != 0, types);
+        }
         dragActive_ = true;
         pressed_ = {};
         dirty_ = true;
@@ -2347,7 +2790,7 @@ void LinuxUi::handleClientMessage(XClientMessageEvent& event) {
         }
         dragActive_ = true;
         dirty_ = true;
-        sendXdndStatus(true);
+        sendXdndStatus(dropAccepted_);
         return;
     }
     if (event.message_type == atomXdndLeave_) {
@@ -2478,6 +2921,14 @@ void LinuxUi::handleEvent(XEvent& event) {
         case MapNotify:
             mapped_ = true;
             dirty_ = true;
+            // Give the window keyboard focus as soon as it is mapped so the
+            // user can type an address without clicking first. Well-behaved
+            // window managers may still take their time; WM_TAKE_FOCUS is
+            // also advertised in createWindow().
+            XSetInputFocus(display_, window_, RevertToParent, CurrentTime);
+            if (inputContext_ != nullptr) {
+                XSetICFocus(inputContext_);
+            }
             break;
         case KeyPress:
             handleKey(event.xkey);
@@ -2492,10 +2943,20 @@ void LinuxUi::handleEvent(XEvent& event) {
             handleMotion(event.xmotion);
             break;
         case ClientMessage:
-            if (static_cast<Atom>(event.xclient.data.l[0]) == atomWmDelete_ &&
-                event.xclient.message_type ==
-                    XInternAtom(display_, "WM_PROTOCOLS", False)) {
-                running_ = false;
+            if (event.xclient.message_type == atomWmProtocols_) {
+                const Atom protocol =
+                    static_cast<Atom>(event.xclient.data.l[0]);
+                if (protocol == atomWmDelete_) {
+                    running_ = false;
+                } else if (protocol == atomWmTakeFocus_) {
+                    const Time timestamp =
+                        static_cast<Time>(event.xclient.data.l[1]);
+                    XSetInputFocus(display_, window_, RevertToParent,
+                                   timestamp != 0 ? timestamp : CurrentTime);
+                    if (inputContext_ != nullptr) {
+                        XSetICFocus(inputContext_);
+                    }
+                }
             } else {
                 handleClientMessage(event.xclient);
             }
@@ -2507,7 +2968,15 @@ void LinuxUi::handleEvent(XEvent& event) {
             handlePropertyNotify(event.xproperty);
             break;
         case FocusIn:
+            if (inputContext_ != nullptr) {
+                XSetICFocus(inputContext_);
+            }
             dirty_ = true;
+            break;
+        case FocusOut:
+            if (inputContext_ != nullptr) {
+                XUnsetICFocus(inputContext_);
+            }
             break;
         default:
             break;
@@ -2519,10 +2988,15 @@ int LinuxUi::run() {
     render();
     auto nextPoll = std::chrono::steady_clock::now() +
                     std::chrono::milliseconds(kPollIntervalMs);
-    while (running_) {
+    while (running_ && g_terminateRequested == 0) {
         while (XPending(display_) > 0) {
             XEvent event{};
             XNextEvent(display_, &event);
+            // Let the input method consume keys it is composing before the
+            // application sees them (e.g. fcitx/ibus Chinese input).
+            if (XFilterEvent(&event, None)) {
+                continue;
+            }
             handleEvent(event);
         }
         const auto now = std::chrono::steady_clock::now();

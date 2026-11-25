@@ -12,6 +12,8 @@ PREFIX ?= /usr/local
 ARCH_FLAGS ?=
 TARGET := build/landrop
 TEST_TARGET := build/landrop-tests
+DESKTOP_FILE := resources/landrop.desktop
+ICON_FILE := resources/landrop.svg
 
 PKG_CONFIG ?= pkg-config
 X11_CFLAGS := $(shell $(PKG_CONFIG) --cflags x11 xft fontconfig 2>/dev/null)
@@ -68,6 +70,12 @@ run: $(TARGET)
 install: $(TARGET)
 	install -d $(DESTDIR)$(PREFIX)/bin
 	install -m 0755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/landrop
+	install -d $(DESTDIR)$(PREFIX)/share/applications
+	install -m 0644 $(DESKTOP_FILE) \
+		$(DESTDIR)$(PREFIX)/share/applications/landrop.desktop
+	install -d $(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps
+	install -m 0644 $(ICON_FILE) \
+		$(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/landrop.svg
 
 clean:
 	rm -rf build

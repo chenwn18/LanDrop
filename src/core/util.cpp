@@ -5,9 +5,15 @@
 #include <cctype>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <random>
 #include <sstream>
+#include <vector>
+
+#ifndef _WIN32
+#include <pwd.h>
+#endif
 
 #include "common.h"
 #include "platform.h"
@@ -202,6 +208,47 @@ std::string pathToUtf8(const fs::path& path) {
 
 std::string genericPathToUtf8(const fs::path& path) {
     return path.generic_u8string();
+}
+
+fs::path expandUserPath(const fs::path& path) {
+#ifdef _WIN32
+    // Windows has no shell tilde convention; keep the path exactly as typed.
+    return path;
+#else
+    const std::string text = pathToUtf8(path);
+    if (text.empty() || text.front() != '~') {
+        return path;
+    }
+    const std::size_t slash = text.find('/');
+    const std::string account =
+        slash == std::string::npos ? text.substr(1)
+                                   : text.substr(1, slash - 1);
+    const std::string remainder =
+        slash == std::string::npos ? std::string() : text.substr(slash);
+    if (account.empty()) {
+        const char* home = std::getenv("HOME");
+        if (home == nullptr || *home == '\0') {
+            return path;
+        }
+        return pathFromUtf8(std::string(home) + remainder);
+    }
+    std::vector<char> buffer(4096);
+    for (;;) {
+        passwd entry{};
+        passwd* result = nullptr;
+        const int status = getpwnam_r(account.c_str(), &entry, buffer.data(),
+                                      buffer.size(), &result);
+        if (status == ERANGE) {
+            buffer.resize(buffer.size() * 2);
+            continue;
+        }
+        if (status != 0 || result == nullptr || result->pw_dir == nullptr ||
+            *result->pw_dir == '\0') {
+            return path;
+        }
+        return pathFromUtf8(std::string(result->pw_dir) + remainder);
+    }
+#endif
 }
 
 bool validateRelativePath(const std::string& relativePath,

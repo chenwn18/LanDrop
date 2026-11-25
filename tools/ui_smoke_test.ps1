@@ -107,6 +107,19 @@ try {
         throw '无法找到 LanDrop 窗口'
     }
 
+    $targetEdit = [LanDropUi]::ChildById($senderWindow, 1001)
+    $peerCombo = [LanDropUi]::ChildById($senderWindow, 1002)
+    if ($targetEdit -eq [IntPtr]::Zero -or $peerCombo -eq [IntPtr]::Zero) {
+        throw '无法找到目标输入框或设备下拉框'
+    }
+    $targetSize = [LanDropUi]::WindowSize($targetEdit)
+    $comboSize = [LanDropUi]::WindowSize($peerCombo)
+    if ($null -eq $targetSize -or $null -eq $comboSize -or
+        [Math]::Abs($targetSize[1] - $comboSize[1]) -gt 1) {
+        throw '目标 IP 输入框与设备下拉框高度不一致'
+    }
+    Write-Host "Target row height: $($targetSize[1]) px (combo $($comboSize[1]) px)"
+
     for ($i = 0; $i -lt 20; $i++) {
         Dismiss-WarningDialogs $senderProcess.Id
         Start-Sleep -Milliseconds 250
@@ -163,6 +176,32 @@ try {
     Write-Host "Size:     $((Get-Item $destination).Length) bytes"
     Write-Host "SHA-256 match: $($sourceHash -eq $destinationHash)"
 
+    $resetDeadline = (Get-Date).AddSeconds(20)
+    while ((Get-Date) -lt $resetDeadline) {
+        Dismiss-WarningDialogs $senderProcess.Id
+        $sendButton = [LanDropUi]::ChildById($senderWindow, 1006)
+        if ($sendButton -eq [IntPtr]::Zero -or
+            -not [LanDropUi]::Enabled($sendButton)) {
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    }
+    if ($sendButton -ne [IntPtr]::Zero -and
+        [LanDropUi]::Enabled($sendButton)) {
+        throw '发送成功后拖拽区域未重置（发送按钮仍然可用）'
+    }
+    Write-Host "Selection reset after success: True"
+
+    $statusLabel = [LanDropUi]::ChildById($senderWindow, 1018)
+    if ($statusLabel -eq [IntPtr]::Zero) {
+        throw '无法找到底部状态行'
+    }
+    $statusText = [LanDropUi]::ControlText($statusLabel)
+    if ($statusText -notlike '发送完成*') {
+        throw "发送完成后底部未显示成功提示: $statusText"
+    }
+    Write-Host "Completion notice: $statusText"
+
     Start-Sleep -Seconds 1
     function Save-Window([IntPtr]$Handle, [string]$Path) {
         $size = [LanDropUi]::WindowSize($Handle)
@@ -182,6 +221,13 @@ try {
     [void](Save-Window $receiverWindow $receiverShot)
     [void](Save-Window $senderWindow $senderShot)
     Write-Host "Screenshots: $receiverShot ; $senderShot"
+
+    Start-Sleep -Seconds 8
+    $statusText = [LanDropUi]::ControlText($statusLabel)
+    if ($statusText -notlike '上次传输完成*') {
+        throw "成功提示过期后底部未显示上次传输结果: $statusText"
+    }
+    Write-Host "Last result notice: $statusText"
 
     if ($sourceHash -ne $destinationHash) { throw 'SHA-256 mismatch' }
     Remove-Item $destination -Force

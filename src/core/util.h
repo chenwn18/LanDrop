@@ -22,6 +22,11 @@ std::string randomHex(std::size_t byteCount);
 fs::path pathFromUtf8(const std::string& utf8);
 std::string pathToUtf8(const fs::path& path);
 std::string genericPathToUtf8(const fs::path& path);
+// Expands a leading "~" or "~user" component with the account database.
+// Windows has no shell tilde convention, so paths are returned unchanged
+// there. Paths that do not start with '~' or name an unknown account are
+// returned unchanged as well.
+fs::path expandUserPath(const fs::path& path);
 
 bool validateRelativePath(const std::string& relativePath,
                           std::string& errorMessage);

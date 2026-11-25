@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -242,6 +243,28 @@ void testPaths() {
     check(isValidUtf8("中文文件名"), "UTF-8 validation accepts Chinese");
     check(!isValidUtf8(std::string("\xff\xfe", 2)),
           "UTF-8 validation rejects invalid bytes");
+}
+
+void testUserPathExpansion() {
+#ifndef _WIN32
+    const char* home = std::getenv("HOME");
+    if (home != nullptr && *home != '\0') {
+        check(expandUserPath(pathFromUtf8("~/LanDrop")) ==
+                  pathFromUtf8(home) / "LanDrop",
+              "tilde path expands to the home directory");
+        check(expandUserPath(fs::path("~")) == pathFromUtf8(home),
+              "bare tilde expands to the home directory");
+    }
+    check(expandUserPath(pathFromUtf8("/tmp/lan-drop")) ==
+              pathFromUtf8("/tmp/lan-drop"),
+          "absolute paths are not changed by tilde expansion");
+    check(expandUserPath(pathFromUtf8("relative/path")) ==
+              pathFromUtf8("relative/path"),
+          "relative paths are not changed by tilde expansion");
+    check(expandUserPath(pathFromUtf8("~no-such-user-lan-drop/x")) ==
+              pathFromUtf8("~no-such-user-lan-drop/x"),
+          "unknown ~user paths are left unchanged");
+#endif
 }
 
 void testProtocol() {
@@ -1015,6 +1038,49 @@ void testDiscoveryShutdown(WorkDir& work) {
     check(stopSeconds < 5.0, "discovery shutdown is prompt");
 }
 
+void testSendOnlyDiscovery(WorkDir& work) {
+    std::string listenerError;
+    uint16_t occupiedPort = 0;
+    auto occupied = Socket::createListener(0, occupiedPort, listenerError);
+    check(occupied != nullptr, "port-conflict listener created");
+
+    const uint16_t discoveryPort = 48855;
+    AppController controller;
+    ControllerOptions options;
+    options.receiveDirectory = work.path() / "send-only-inbox";
+    options.deviceName = "SendOnlyHost";
+    options.listenPort = occupiedPort;
+    options.discoveryPort = discoveryPort;
+    options.enableDiscovery = true;
+    std::string warning;
+    check(controller.start(options, warning), "send-only controller starts");
+    check(!controller.snapshot().serverListening,
+          "send-only controller does not listen");
+    check(!warning.empty(), "send-only mode reports the port conflict");
+    check(controller.snapshot().discoveryActive,
+          "send-only mode still runs discovery");
+
+    const std::string peerName = "SendOnlyProbe";
+    check(sendLoopbackUdp(discoveryPort,
+                          makeDiscoveryProbe(peerName, kDefaultTcpPort)),
+          "send-only discovery datagram sent");
+    bool sawPeer = false;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < deadline) {
+        for (const auto& peer : controller.snapshot().peers) {
+            if (peer.name == peerName) {
+                sawPeer = true;
+            }
+        }
+        if (sawPeer) break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    check(sawPeer, "send-only instance received loopback beacon");
+    controller.stop();
+    occupied.reset();
+}
+
 void testResume(WorkDir& work) {
     const fs::path sourceRoot = work.path() / "resume-source";
     const fs::path receiveRoot = work.path() / "resume-received";
@@ -1173,6 +1239,7 @@ int main() {
         WorkDir work;
         testSha256();
         testPaths();
+        testUserPathExpansion();
         testProtocol();
         testSocketPoll();
         testTransfer(work);
@@ -1182,6 +1249,7 @@ int main() {
         testResume(work);
         testAutomaticResume(work);
         testDiscoveryShutdown(work);
+        testSendOnlyDiscovery(work);
         testTraversalRejection(work);
     } catch (const std::exception& error) {
         ++g_failures;

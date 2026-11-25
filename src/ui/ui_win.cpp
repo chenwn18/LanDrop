@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <ctime>
 #include <cwchar>
 #include <memory>
@@ -232,6 +233,11 @@ struct RowCache {
     std::array<std::wstring, 6> cells;
 };
 
+struct PendingSend {
+    uint64_t jobId = 0;
+    std::vector<std::string> pathKeys;
+};
+
 struct AppWindow {
     HWND hwnd = nullptr;
     HINSTANCE instance = nullptr;
@@ -244,10 +250,13 @@ struct AppWindow {
     uint64_t lastLogSequence = 0;
     UiMetrics metrics;
     std::vector<RowCache> rows;
+    std::vector<PendingSend> pendingSends;
     std::vector<landrop::PeerView> comboPeers;
     std::wstring peerSignature = L"<uninitialized>";
     std::wstring headerSignature;
     std::wstring progressTextCache;
+    std::wstring toastText;
+    std::chrono::steady_clock::time_point toastUntil{};
     int dpi = 96;
     bool syncingControls = false;
 
@@ -390,13 +399,29 @@ void applyFonts(AppWindow& app) {
     sendFont(app.progressLabel, app.fontSmall);
 }
 
+void setToast(AppWindow& app, const std::wstring& message) {
+    if (message.empty()) {
+        return;
+    }
+    app.toastText = message;
+    app.toastUntil =
+        std::chrono::steady_clock::now() + std::chrono::seconds(7);
+}
+
+void clearExpiredToast(AppWindow& app) {
+    if (!app.toastText.empty() &&
+        std::chrono::steady_clock::now() >= app.toastUntil) {
+        app.toastText.clear();
+    }
+}
+
 void addSelectedPaths(AppWindow& app,
                       const std::vector<landrop::fs::path>& paths) {
     std::set<std::string> existing;
     for (const auto& path : app.selectedPaths) {
         existing.insert(landrop::pathCollisionKey(path));
     }
-    bool changed = false;
+    std::size_t added = 0;
     for (const auto& input : paths) {
         if (input.empty()) {
             continue;
@@ -413,15 +438,16 @@ void addSelectedPaths(AppWindow& app,
         const std::string key = landrop::pathCollisionKey(absolute);
         if (existing.insert(key).second) {
             app.selectedPaths.push_back(absolute);
-            changed = true;
+            ++added;
         }
     }
-    if (!changed) {
+    if (added == 0) {
         return;
     }
     EnableWindow(app.sendButton, TRUE);
     EnableWindow(app.clearSelection, TRUE);
     InvalidateRect(app.dropZone, nullptr, TRUE);
+    setToast(app, L"已添加 " + std::to_wstring(added) + L" 个项目");
 }
 
 std::wstring selectedSubtitle(const AppWindow& app) {
@@ -447,6 +473,56 @@ void updateSelectionControls(AppWindow& app) {
     EnableWindow(app.sendButton, hasSelection);
     EnableWindow(app.clearSelection, hasSelection);
     InvalidateRect(app.dropZone, nullptr, TRUE);
+}
+
+void processPendingSends(AppWindow& app) {
+    if (app.pendingSends.empty()) {
+        return;
+    }
+    bool selectionChanged = false;
+    for (auto it = app.pendingSends.begin(); it != app.pendingSends.end();) {
+        const landrop::TransferView* job = nullptr;
+        for (const auto& candidate : app.snapshot.transfers) {
+            if (candidate.id == it->jobId) {
+                job = &candidate;
+                break;
+            }
+        }
+        if (job == nullptr) {
+            // The user cleared the finished job before the refresh timer ran;
+            // keep the selection rather than guessing the outcome.
+            it = app.pendingSends.erase(it);
+            continue;
+        }
+        if (job->state == landrop::TransferState::Completed) {
+            const std::set<std::string> sentKeys(it->pathKeys.begin(),
+                                                 it->pathKeys.end());
+            const std::size_t before = app.selectedPaths.size();
+            app.selectedPaths.erase(
+                std::remove_if(
+                    app.selectedPaths.begin(), app.selectedPaths.end(),
+                    [&](const landrop::fs::path& path) {
+                        return sentKeys.count(
+                                   landrop::pathCollisionKey(path)) != 0;
+                    }),
+                app.selectedPaths.end());
+            if (app.selectedPaths.size() != before) {
+                selectionChanged = true;
+            }
+            it = app.pendingSends.erase(it);
+            continue;
+        }
+        if (job->state == landrop::TransferState::Failed ||
+            job->state == landrop::TransferState::Canceled) {
+            // Keep the selection so the user can retry after a failure.
+            it = app.pendingSends.erase(it);
+            continue;
+        }
+        ++it;
+    }
+    if (selectionChanged) {
+        updateSelectionControls(app);
+    }
 }
 
 void saveCurrentSettings(AppWindow& app) {
@@ -509,9 +585,13 @@ void createChildControls(AppWindow& app) {
                  MAKELPARAM(MulDiv(7, app.dpi, 96),
                             MulDiv(7, app.dpi, 96)));
 
+    // Windows draws a non-owner-draw combo's text at the top of an enlarged
+    // selection field (and list row), so draw the items ourselves and center
+    // the text vertically. This only affects the peer selector.
     app.peerCombo = CreateWindowExW(
         0, WC_COMBOBOXW, L"",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST,
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | CBS_DROPDOWNLIST |
+            CBS_OWNERDRAWFIXED | CBS_HASSTRINGS,
         0, 0, 10, 200, parent,
         reinterpret_cast<HMENU>(static_cast<INT_PTR>(IDC_PEER_COMBO)), instance,
         nullptr);
@@ -576,8 +656,9 @@ void createChildControls(AppWindow& app) {
     app.cancelJob = createButton(L"取消任务", IDC_CANCEL_JOB, true);
     app.viewLogs = createButton(L"日志", IDC_VIEW_LOGS, true);
     app.clearDone = createButton(L"清除已结束", IDC_CLEAR_DONE, true);
-    app.progressLabel = createStatic(L"", SS_LEFT | SS_NOPREFIX | SS_CENTERIMAGE,
-                                     IDC_PROGRESS_LABEL);
+    app.progressLabel = createStatic(
+        L"", SS_LEFT | SS_NOPREFIX | SS_CENTERIMAGE | SS_ENDELLIPSIS,
+        IDC_PROGRESS_LABEL);
     app.progressBar = CreateWindowExW(
         0, PROGRESS_CLASSW, L"",
         WS_CHILD | WS_VISIBLE | PBS_SMOOTH, 0, 0, 10, 10,
@@ -595,6 +676,37 @@ void createChildControls(AppWindow& app) {
     EnableWindow(app.sendButton, FALSE);
     EnableWindow(app.clearSelection, FALSE);
     EnableWindow(app.cancelJob, FALSE);
+}
+
+void fitComboClosedHeight(HWND combo, int targetHeight) {
+    // The height passed to MoveWindow is the height of the dropped list, not
+    // the visible selection field. CB_SETITEMHEIGHT(-1) controls the latter.
+    const LRESULT itemHeight =
+        SendMessageW(combo, CB_GETITEMHEIGHT, static_cast<WPARAM>(-1), 0);
+    if (itemHeight == CB_ERR) {
+        return;
+    }
+    for (int pass = 0; pass < 2; ++pass) {
+        RECT rect{};
+        if (!GetWindowRect(combo, &rect)) {
+            return;
+        }
+        const int delta = targetHeight - (rect.bottom - rect.top);
+        if (delta == 0) {
+            return;
+        }
+        const LRESULT current =
+            SendMessageW(combo, CB_GETITEMHEIGHT, static_cast<WPARAM>(-1), 0);
+        if (current == CB_ERR) {
+            return;
+        }
+        const int updated = static_cast<int>(current) + delta;
+        if (updated < 1) {
+            return;
+        }
+        SendMessageW(combo, CB_SETITEMHEIGHT, static_cast<WPARAM>(-1),
+                     static_cast<LPARAM>(updated));
+    }
 }
 
 void layoutWindow(AppWindow& app) {
@@ -640,6 +752,7 @@ void layoutWindow(AppWindow& app) {
     const int sendInnerWidth =
         (app.metrics.sendCard.right - app.metrics.sendCard.left) - pad * 2;
     const int rowY = cardY + app.scale(46);
+    const int targetRowHeight = app.scale(30);
     const int labelWidth = app.scale(44);
     const int smallGap = app.scale(6);
     const int availableTargetWidth =
@@ -648,15 +761,16 @@ void layoutWindow(AppWindow& app) {
         std::max(app.scale(105),
                  std::min(app.scale(200), availableTargetWidth * 42 / 100));
     const int editWidth = availableTargetWidth - comboWidth;
+    const int targetX = sendInnerX + labelWidth + smallGap;
     MoveWindow(app.targetLabel, sendInnerX, rowY, labelWidth,
-               app.scale(30), TRUE);
-    MoveWindow(app.targetEdit, sendInnerX + labelWidth + smallGap, rowY,
-               editWidth, app.scale(30), TRUE);
-    MoveWindow(app.peerCombo,
-               sendInnerX + labelWidth + smallGap + editWidth + smallGap,
-               rowY, comboWidth, app.scale(200), TRUE);
+               targetRowHeight, TRUE);
+    MoveWindow(app.targetEdit, targetX, rowY, editWidth, targetRowHeight,
+               TRUE);
+    MoveWindow(app.peerCombo, targetX + editWidth + smallGap, rowY,
+               comboWidth, app.scale(200), TRUE);
     SendMessageW(app.peerCombo, CB_SETDROPPEDWIDTH,
                  std::max(app.scale(180), comboWidth), 0);
+    fitComboClosedHeight(app.peerCombo, targetRowHeight);
 
     const int buttonsY = cardY + app.scale(86);
     const int buttonHeight = app.scale(30);
@@ -1010,24 +1124,36 @@ void updateProgressArea(AppWindow& app) {
             position = static_cast<int>(std::min<uint64_t>(
                 1000, active->bytesDone * 1000 / active->totalBytes));
         }
-    } else if (!app.snapshot.transfers.empty()) {
-        const auto& latest = app.snapshot.transfers.front();
-        if (latest.state == landrop::TransferState::Completed) {
-            label = L"上次传输完成  ·  " + widen(latest.peer);
-            position = 1000;
-        } else if (latest.state == landrop::TransferState::Failed) {
-            label = L"上次传输失败  ·  " +
-                    (latest.error.empty() ? widen(latest.status)
-                                          : widen(latest.error));
-            position = 0;
-        } else if (latest.state == landrop::TransferState::Canceled) {
-            label = L"上次传输已取消";
-            position = 0;
-        } else {
-            label = L"就绪";
-        }
     } else {
-        label = L"就绪  ·  拖入文件或文件夹即可开始发送";
+        if (!app.snapshot.transfers.empty() &&
+            app.snapshot.transfers.front().state ==
+                landrop::TransferState::Completed) {
+            position = 1000;
+        }
+        // Match the Linux status line: a fresh success/warning/error notice
+        // stays visible for a few seconds, then the last transfer result.
+        if (!app.toastText.empty()) {
+            label = app.toastText;
+        } else if (!app.snapshot.transfers.empty()) {
+            const auto& latest = app.snapshot.transfers.front();
+            if (latest.state == landrop::TransferState::Completed) {
+                label = L"上次传输完成  ·  " + widen(latest.peer);
+            } else if (latest.state == landrop::TransferState::Failed) {
+                label = L"上次传输失败  ·  " +
+                        (latest.error.empty() ? widen(latest.status)
+                                              : widen(latest.error));
+            } else if (latest.state == landrop::TransferState::Canceled) {
+                label = L"上次传输已取消";
+            }
+        }
+        if (label.empty()) {
+            if (!app.snapshot.serviceMessage.empty() &&
+                app.snapshot.serviceMessage != "接收服务运行中") {
+                label = widen(app.snapshot.serviceMessage);
+            } else {
+                label = L"就绪  ·  拖入文件或文件夹即可开始发送";
+            }
+        }
     }
     if (label != app.progressTextCache) {
         app.progressTextCache = label;
@@ -1041,15 +1167,20 @@ void refreshUi(AppWindow& app) {
         return;
     }
     app.snapshot = app.controller->snapshot();
+    processPendingSends(app);
     const auto newLogs =
         app.controller->logsAfter(app.lastLogSequence);
     for (const auto& entry : newLogs) {
         app.lastLogSequence = std::max(app.lastLogSequence, entry.sequence);
         app.logs.push_back(entry);
+        if (entry.level != landrop::LogLevel::Info) {
+            setToast(app, widen(entry.text));
+        }
     }
     while (app.logs.size() > 1000) {
         app.logs.erase(app.logs.begin());
     }
+    clearExpiredToast(app);
 
     setWindowTextIfChanged(app.receivePath,
                            app.snapshot.receiveDirectory.wstring());
@@ -1403,6 +1534,71 @@ void drawOwnerButton(AppWindow& app, const DRAWITEMSTRUCT& item) {
     }
 }
 
+void drawPeerComboItem(AppWindow& app, const DRAWITEMSTRUCT& item) {
+    const bool selectionField = (item.itemState & ODS_COMBOBOXEDIT) != 0;
+    const bool disabled = (item.itemState & ODS_DISABLED) != 0 ||
+                          !IsWindowEnabled(item.hwndItem);
+    const bool selected =
+        !selectionField && (item.itemState & ODS_SELECTED) != 0;
+
+    RECT rc = item.rcItem;
+    if (selectionField) {
+        // Never paint over the native drop-down arrow on the right.
+        RECT client{};
+        if (GetClientRect(item.hwndItem, &client)) {
+            const int arrowWidth =
+                GetSystemMetrics(SM_CXVSCROLL) + app.scale(6);
+            const int maxRight = client.right - arrowWidth;
+            if (rc.right > maxRight) {
+                rc.right = std::max<LONG>(rc.left,
+                                          static_cast<LONG>(maxRight));
+            }
+        }
+    }
+
+    HBRUSH brush = CreateSolidBrush(selected ? kAccentTint : kCardColor);
+    FillRect(item.hDC, &rc, brush);
+    DeleteObject(brush);
+
+    std::wstring text;
+    int index = static_cast<int>(item.itemID);
+    if (selectionField && index < 0) {
+        index = static_cast<int>(
+            SendMessageW(item.hwndItem, CB_GETCURSEL, 0, 0));
+    }
+    if (index >= 0) {
+        const LRESULT length = SendMessageW(
+            item.hwndItem, CB_GETLBTEXTLEN, static_cast<WPARAM>(index), 0);
+        if (length > 0) {
+            text.resize(static_cast<std::size_t>(length) + 1);
+            SendMessageW(item.hwndItem, CB_GETLBTEXT,
+                         static_cast<WPARAM>(index),
+                         reinterpret_cast<LPARAM>(text.data()));
+            text.resize(static_cast<std::size_t>(length));
+        }
+    }
+
+    SetBkMode(item.hDC, TRANSPARENT);
+    SetTextColor(item.hDC, disabled ? kDisabledColor
+                                    : (selected ? kAccentColor : kTextColor));
+    HFONT oldFont =
+        static_cast<HFONT>(SelectObject(item.hDC, app.fontBody));
+    RECT textRect = rc;
+    textRect.left += app.scale(7);
+    textRect.right -= app.scale(4);
+    DrawTextW(item.hDC, text.c_str(), -1, &textRect,
+              DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS |
+                  DT_NOPREFIX);
+    SelectObject(item.hDC, oldFont);
+
+    if ((item.itemState & ODS_FOCUS) != 0 &&
+        (item.itemState & ODS_NOFOCUSRECT) == 0) {
+        RECT focus = rc;
+        InflateRect(&focus, -app.scale(2), -app.scale(2));
+        DrawFocusRect(item.hDC, &focus);
+    }
+}
+
 void drawDropZone(AppWindow& app, const DRAWITEMSTRUCT& item) {
     HDC dc = item.hDC;
     RECT rc = item.rcItem;
@@ -1458,14 +1654,27 @@ void sendSelected(AppWindow& app) {
         return;
     }
     std::string error;
-    if (app.controller->send(target, app.selectedPaths, error) == 0) {
+    const uint64_t jobId =
+        app.controller->send(target, app.selectedPaths, error);
+    if (jobId == 0) {
         showError(app.hwnd, widen(error));
+        return;
     }
+    PendingSend pending;
+    pending.jobId = jobId;
+    pending.pathKeys.reserve(app.selectedPaths.size());
+    for (const auto& path : app.selectedPaths) {
+        pending.pathKeys.push_back(landrop::pathCollisionKey(path));
+    }
+    app.pendingSends.push_back(std::move(pending));
+    setToast(app, L"已加入发送队列");
 }
 
 void recreateFontsAndLayout(AppWindow& app) {
     createFonts(app);
     applyFonts(app);
+    SendMessageW(app.peerCombo, CB_SETITEMHEIGHT, 0,
+                 static_cast<LPARAM>(std::max(1, app.scale(24))));
     layoutWindow(app);
 }
 
@@ -1580,6 +1789,11 @@ LRESULT CALLBACK windowProcedure(HWND hwnd, UINT message, WPARAM wParam,
                     drawOwnerButton(*app, *item);
                     return TRUE;
                 }
+                if (item->CtlType == ODT_COMBOBOX &&
+                    item->CtlID == IDC_PEER_COMBO) {
+                    drawPeerComboItem(*app, *item);
+                    return TRUE;
+                }
                 if (item->CtlType == ODT_STATIC &&
                     item->CtlID == IDC_DROP_ZONE) {
                     drawDropZone(*app, *item);
@@ -1587,6 +1801,18 @@ LRESULT CALLBACK windowProcedure(HWND hwnd, UINT message, WPARAM wParam,
                 }
             }
             return FALSE;
+        }
+        case WM_MEASUREITEM: {
+            if (app != nullptr) {
+                auto* measure = reinterpret_cast<MEASUREITEMSTRUCT*>(lParam);
+                if (measure->CtlType == ODT_COMBOBOX &&
+                    measure->CtlID == IDC_PEER_COMBO) {
+                    measure->itemHeight = static_cast<UINT>(
+                        std::max(1, app->scale(24)));
+                    return TRUE;
+                }
+            }
+            break;
         }
         case WM_CTLCOLORSTATIC: {
             if (app != nullptr) {
@@ -1755,6 +1981,8 @@ LRESULT CALLBACK windowProcedure(HWND hwnd, UINT message, WPARAM wParam,
                             BST_CHECKED;
                         app->controller->setAllowIncoming(checked);
                         saveCurrentSettings(*app);
+                        setToast(*app, checked ? L"已允许接收文件"
+                                              : L"已关闭文件接收");
                     }
                     break;
                 case IDC_CHANGE_RECV:
@@ -1773,6 +2001,7 @@ LRESULT CALLBACK windowProcedure(HWND hwnd, UINT message, WPARAM wParam,
                                     app->controller->receiveDirectory()
                                         .wstring());
                                 saveCurrentSettings(*app);
+                                setToast(*app, L"接收目录已更新");
                             }
                         }
                     }
@@ -1791,6 +2020,7 @@ LRESULT CALLBACK windowProcedure(HWND hwnd, UINT message, WPARAM wParam,
                         const uint64_t id = selectedJobId(*app);
                         if (id != 0) {
                             app->controller->cancel(id);
+                            setToast(*app, L"正在取消任务");
                         }
                     }
                     break;
@@ -1803,11 +2033,6 @@ LRESULT CALLBACK windowProcedure(HWND hwnd, UINT message, WPARAM wParam,
                     if (notification == BN_CLICKED) {
                         app->controller->clearFinished();
                         refreshUi(*app);
-                    }
-                    break;
-                case IDC_TARGET_EDIT:
-                    if (notification == EN_CHANGE) {
-                        // Nothing needed; the button is enabled by selection.
                     }
                     break;
                 default:

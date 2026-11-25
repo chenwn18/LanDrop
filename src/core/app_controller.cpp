@@ -139,7 +139,7 @@ bool AppController::start(const ControllerOptions& options,
             return false;
         }
         std::error_code ec;
-        fs::path absolute = fs::absolute(value, ec);
+        fs::path absolute = fs::absolute(expandUserPath(value), ec);
         if (ec) {
             error = "无法解析接收目录: " + pathToUtf8(value) + " — " +
                     platform::errorCodeMessage(ec);
@@ -186,7 +186,10 @@ bool AppController::start(const ControllerOptions& options,
         receiver_ && receiver_->running() ? receiver_->port() : 0;
     state_.setListenPort(actualPort);
 
-    if (receiver_ && receiver_->running() && options.enableDiscovery) {
+    // Discovery also runs in send-only mode (tcpPort 0). The beacon protocol
+    // rejects port 0, so other LanDrop instances ignore our advertisement
+    // while this instance can still list peers it may send to.
+    if (options.enableDiscovery) {
         discovery_ = std::make_unique<DiscoveryService>(
             state_, randomHex(16), deviceName, actualPort,
             options.discoveryPort);
@@ -353,7 +356,7 @@ bool AppController::setReceiveDirectory(
         return false;
     }
     std::error_code ec;
-    fs::path absolute = fs::absolute(directory, ec);
+    fs::path absolute = fs::absolute(expandUserPath(directory), ec);
     if (ec) {
         error = "无法解析接收目录: " + platform::errorCodeMessage(ec);
         return false;

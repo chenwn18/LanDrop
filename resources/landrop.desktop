@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=LanDrop
+Name[zh_CN]=LanDrop 局域网快传
+GenericName=LAN File Transfer
+GenericName[zh_CN]=局域网文件快传
+Comment=Send files and folders directly to another computer on the local network
+Comment[zh_CN]=在局域网内直接向另一台电脑发送文件和文件夹
+Exec=landrop %F
+Icon=landrop
+Terminal=false
+Categories=Network;FileTransfer;
+Keywords=LAN;file;transfer;share;send;局域网;传输;发送;
+StartupNotify=true
+StartupWMClass=LanDrop
