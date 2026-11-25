@@ -33,10 +33,21 @@ public:
                    const std::atomic<bool>* abort, std::string& error);
     bool sendAll(const void* data, std::size_t size, int timeoutMs,
                  const std::atomic<bool>* abort, std::string& error);
+    // Sends two buffers as one logical stream. A frame header followed by its
+    // payload goes out in a single syscall so the header is not emitted as a
+    // standalone tiny segment.
+    bool sendAllVectored(const void* first, std::size_t firstSize,
+                         const void* second, std::size_t secondSize,
+                         int timeoutMs, const std::atomic<bool>* abort,
+                         std::string& error);
     bool recvAll(void* data, std::size_t size, int timeoutMs,
                  const std::atomic<bool>* abort, std::string& error);
     bool waitReadable(int timeoutMs, const std::atomic<bool>* abort,
                       bool& aborted, std::string& error) const;
+    // Wakes a blocking recv/send in another thread. Used to stop the receive
+    // pipeline on cancellation or a local write error without waiting for the
+    // inactivity timeout.
+    void shutdownBoth();
     void close();
     bool valid() const;
     uint16_t localPort() const;

@@ -12,7 +12,9 @@ inline constexpr uint16_t kProtocolVersion = 1;
 inline constexpr uint16_t kDefaultTcpPort = 47653;
 inline constexpr uint16_t kDefaultDiscoveryPort = 47654;
 inline constexpr std::size_t kMaxFramePayload = 1024 * 1024;
-inline constexpr std::size_t kTransferChunkSize = 256 * 1024;
+// Fill a complete protocol frame per write. The four-byte file index is part
+// of every FileData payload, so the data chunk is four bytes smaller.
+inline constexpr std::size_t kTransferChunkSize = kMaxFramePayload - 4;
 inline constexpr std::size_t kMaxRelativePathBytes = 4096;
 inline constexpr uint32_t kMaxManifestEntries = 200000;
 inline constexpr std::size_t kMaxManifestPathBytes = 16 * 1024 * 1024;

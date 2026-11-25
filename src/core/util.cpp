@@ -327,13 +327,11 @@ std::string caseFoldForPathComparison(std::string value) {
 }
 
 std::string manifestNameKey(std::string value) {
-#ifdef _WIN32
-    return platform::caseFoldForComparison(value);
-#else
-    // Keep the historical portable behavior for top-level names: treat ASCII
-    // case variants as the same name even though Linux would allow both.
-    return toLowerAscii(std::move(value));
-#endif
+    // Top-level names must follow the *sender's* path semantics: Windows
+    // folds case (a case-insensitive filesystem cannot hold both spellings),
+    // while POSIX keeps case exactly. Folding on Linux would silently rename
+    // Report.txt/report.txt even though both can coexist.
+    return caseFoldForPathComparison(std::move(value));
 }
 
 std::string pathCollisionKey(const fs::path& path) {

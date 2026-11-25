@@ -243,6 +243,19 @@ void testPaths() {
     check(isValidUtf8("中文文件名"), "UTF-8 validation accepts Chinese");
     check(!isValidUtf8(std::string("\xff\xfe", 2)),
           "UTF-8 validation rejects invalid bytes");
+#ifdef _WIN32
+    checkEqual(manifestNameKey("Report.txt"), manifestNameKey("report.txt"),
+               "Windows top-level name keys ignore case");
+    checkEqual(pathCollisionKey(pathFromUtf8("C:/Data/File")),
+               pathCollisionKey(pathFromUtf8("C:/Data/file")),
+               "Windows path collision keys ignore case");
+#else
+    check(manifestNameKey("Report.txt") != manifestNameKey("report.txt"),
+          "POSIX top-level name keys preserve case");
+    check(pathCollisionKey(pathFromUtf8("/tmp/Data")) !=
+              pathCollisionKey(pathFromUtf8("/tmp/data")),
+          "POSIX path collision keys preserve case");
+#endif
 }
 
 void testUserPathExpansion() {
@@ -859,6 +872,210 @@ void testAutomaticResume(WorkDir& work) {
     receiver.stop();
 }
 
+void testCaseSensitiveTopLevelNames(WorkDir& work) {
+    (void)work;
+#ifndef _WIN32
+    const fs::path sourceA = work.path() / "case-top-a";
+    const fs::path sourceB = work.path() / "case-top-b";
+    const fs::path receiveRoot = work.path() / "case-top-received";
+    writeTextFile(sourceA / "Report.txt", "upper top-level\n");
+    writeTextFile(sourceB / "report.txt", "lower top-level\n");
+    fs::create_directories(receiveRoot);
+
+    AppController receiver;
+    ControllerOptions receiverOptions;
+    receiverOptions.receiveDirectory = receiveRoot;
+    receiverOptions.deviceName = "CaseTopReceiver";
+    receiverOptions.listenPort = 0;
+    receiverOptions.enableDiscovery = false;
+    std::string warning;
+    check(receiver.start(receiverOptions, warning),
+          "case top-level receiver starts");
+
+    AppController sender;
+    ControllerOptions senderOptions;
+    senderOptions.receiveDirectory = work.path() / "case-top-sender-inbox";
+    senderOptions.deviceName = "CaseTopSender";
+    senderOptions.listenPort = 0;
+    senderOptions.enableDiscovery = false;
+    sender.start(senderOptions, warning);
+    check(sender.send("127.0.0.1:" + std::to_string(receiver.listenPort()),
+                      {sourceA / "Report.txt", sourceB / "report.txt"},
+                      warning) != 0,
+          "case-variant top-level send accepted");
+
+    const TransferResult result = waitForTransfer(sender, receiver);
+    check(result.completed, "case-variant top-level transfer completes");
+    check(fs::exists(receiveRoot / "Report.txt"),
+          "uppercase top-level name preserved");
+    check(fs::exists(receiveRoot / "report.txt"),
+          "lowercase top-level name preserved");
+    check(!fs::exists(receiveRoot / "report (2).txt"),
+          "no unnecessary top-level case rename");
+    if (fs::exists(receiveRoot / "Report.txt") &&
+        fs::exists(receiveRoot / "report.txt")) {
+        check(readTextFile(receiveRoot / "Report.txt") ==
+                  "upper top-level\n",
+              "uppercase top-level content preserved");
+        check(readTextFile(receiveRoot / "report.txt") ==
+                  "lower top-level\n",
+              "lowercase top-level content preserved");
+    }
+
+    sender.stop();
+    receiver.stop();
+#endif
+}
+
+void testCaseSensitiveNestedNames(WorkDir& work) {
+    (void)work;
+#ifndef _WIN32
+    const fs::path sourceRoot = work.path() / "case-nested-source";
+    const fs::path folder = sourceRoot / "case-folder";
+    const fs::path receiveRoot = work.path() / "case-nested-received";
+    writeTextFile(folder / "File.txt", "upper nested\n");
+    writeTextFile(folder / "file.txt", "lower nested\n");
+    fs::create_directories(receiveRoot);
+
+    AppController receiver;
+    ControllerOptions receiverOptions;
+    receiverOptions.receiveDirectory = receiveRoot;
+    receiverOptions.deviceName = "CaseNestedReceiver";
+    receiverOptions.listenPort = 0;
+    receiverOptions.enableDiscovery = false;
+    std::string warning;
+    check(receiver.start(receiverOptions, warning),
+          "case nested receiver starts");
+
+    AppController sender;
+    ControllerOptions senderOptions;
+    senderOptions.receiveDirectory = work.path() / "case-nested-sender-inbox";
+    senderOptions.deviceName = "CaseNestedSender";
+    senderOptions.listenPort = 0;
+    senderOptions.enableDiscovery = false;
+    sender.start(senderOptions, warning);
+    check(sender.send("127.0.0.1:" + std::to_string(receiver.listenPort()),
+                      {folder}, warning) != 0,
+          "case-variant nested send accepted");
+
+    const TransferResult result = waitForTransfer(sender, receiver);
+    check(result.completed, "case-variant nested transfer completes");
+    const fs::path receivedFolder = receiveRoot / "case-folder";
+    check(fs::exists(receivedFolder / "File.txt"),
+          "uppercase nested name preserved");
+    check(fs::exists(receivedFolder / "file.txt"),
+          "lowercase nested name preserved");
+    if (fs::exists(receivedFolder / "File.txt") &&
+        fs::exists(receivedFolder / "file.txt")) {
+        check(readTextFile(receivedFolder / "File.txt") == "upper nested\n",
+              "uppercase nested content preserved");
+        check(readTextFile(receivedFolder / "file.txt") == "lower nested\n",
+              "lowercase nested content preserved");
+    }
+
+    sender.stop();
+    receiver.stop();
+#endif
+}
+
+void testCaseVariantDoesNotOverwriteExisting(WorkDir& work) {
+    (void)work;
+#ifndef _WIN32
+    const fs::path sourceRoot = work.path() / "case-existing-source";
+    const fs::path receiveRoot = work.path() / "case-existing-received";
+    writeTextFile(sourceRoot / "existing.txt", "incoming lower\n");
+    fs::create_directories(receiveRoot);
+    writeTextFile(receiveRoot / "Existing.txt", "keep existing upper\n");
+
+    AppController receiver;
+    ControllerOptions receiverOptions;
+    receiverOptions.receiveDirectory = receiveRoot;
+    receiverOptions.deviceName = "CaseExistingReceiver";
+    receiverOptions.listenPort = 0;
+    receiverOptions.enableDiscovery = false;
+    std::string warning;
+    check(receiver.start(receiverOptions, warning),
+          "case existing receiver starts");
+
+    AppController sender;
+    ControllerOptions senderOptions;
+    senderOptions.receiveDirectory = work.path() / "case-existing-sender-inbox";
+    senderOptions.deviceName = "CaseExistingSender";
+    senderOptions.listenPort = 0;
+    senderOptions.enableDiscovery = false;
+    sender.start(senderOptions, warning);
+    check(sender.send("127.0.0.1:" + std::to_string(receiver.listenPort()),
+                      {sourceRoot / "existing.txt"}, warning) != 0,
+          "case-existing-variant send accepted");
+
+    const TransferResult result = waitForTransfer(sender, receiver);
+    check(result.completed, "case-existing-variant transfer completes");
+    check(fs::exists(receiveRoot / "Existing.txt"),
+          "existing case-variant file still exists");
+    if (fs::exists(receiveRoot / "Existing.txt")) {
+        check(readTextFile(receiveRoot / "Existing.txt") ==
+                  "keep existing upper\n",
+              "existing case-variant file not overwritten");
+    }
+    check(fs::exists(receiveRoot / "existing.txt"),
+          "incoming case variant written separately");
+    if (fs::exists(receiveRoot / "existing.txt")) {
+        check(readTextFile(receiveRoot / "existing.txt") ==
+                  "incoming lower\n",
+              "incoming case-variant content preserved");
+    }
+
+    sender.stop();
+    receiver.stop();
+#endif
+}
+
+void testCaseVariantReservedName(WorkDir& work) {
+    (void)work;
+#ifndef _WIN32
+    const fs::path sourceRoot = work.path() / "case-reserved-source";
+    const fs::path folder = sourceRoot / ".Landrop-Parts";
+    const fs::path receiveRoot = work.path() / "case-reserved-received";
+    writeTextFile(folder / "note.txt", "reserved case variant\n");
+    fs::create_directories(receiveRoot);
+
+    AppController receiver;
+    ControllerOptions receiverOptions;
+    receiverOptions.receiveDirectory = receiveRoot;
+    receiverOptions.deviceName = "CaseReservedReceiver";
+    receiverOptions.listenPort = 0;
+    receiverOptions.enableDiscovery = false;
+    std::string warning;
+    check(receiver.start(receiverOptions, warning),
+          "case reserved receiver starts");
+
+    AppController sender;
+    ControllerOptions senderOptions;
+    senderOptions.receiveDirectory = work.path() / "case-reserved-sender-inbox";
+    senderOptions.deviceName = "CaseReservedSender";
+    senderOptions.listenPort = 0;
+    senderOptions.enableDiscovery = false;
+    sender.start(senderOptions, warning);
+    check(sender.send("127.0.0.1:" + std::to_string(receiver.listenPort()),
+                      {folder}, warning) != 0,
+          "case-variant reserved-name send accepted");
+
+    const TransferResult result = waitForTransfer(sender, receiver);
+    check(result.completed,
+          "reserved-name case variant is allowed on a case-sensitive filesystem");
+    const fs::path receivedNote = receiveRoot / ".Landrop-Parts" / "note.txt";
+    check(fs::exists(receivedNote),
+          "reserved-name case variant folder received");
+    if (fs::exists(receivedNote)) {
+        check(readTextFile(receivedNote) == "reserved case variant\n",
+              "reserved-name case variant content preserved");
+    }
+
+    sender.stop();
+    receiver.stop();
+#endif
+}
+
 void testUnicodeCaseCollision(WorkDir& work) {
     const fs::path sourceA = work.path() / "unicode-a";
     const fs::path sourceB = work.path() / "unicode-b";
@@ -1244,6 +1461,10 @@ int main() {
         testSocketPoll();
         testTransfer(work);
         testRemoteErrorDuringData(work);
+        testCaseSensitiveTopLevelNames(work);
+        testCaseSensitiveNestedNames(work);
+        testCaseVariantDoesNotOverwriteExisting(work);
+        testCaseVariantReservedName(work);
         testUnicodeCaseCollision(work);
         testExistingFileSkip(work);
         testResume(work);

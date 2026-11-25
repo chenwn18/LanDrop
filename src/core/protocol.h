@@ -180,6 +180,10 @@ public:
     void send(MessageType type, const std::vector<uint8_t>& payload,
               int timeoutMs);
     Frame read(int timeoutMs);
+    // Reads into a caller-owned frame so a hot receive loop can reuse the
+    // payload allocation instead of allocating and zeroing a fresh buffer for
+    // every file data frame.
+    void readInto(Frame& frame, int timeoutMs);
 
 private:
     Socket& socket_;

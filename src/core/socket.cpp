@@ -20,6 +20,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <unistd.h>
 #endif
 
@@ -27,7 +28,32 @@ namespace landrop {
 namespace {
 
 constexpr int kSelectSliceMs = 200;
-constexpr int kSocketBufferBytes = 1024 * 1024;
+// A 4 MiB send buffer is enough for a gigabit bandwidth-delay product with a
+// wide range of round-trip times. It must be applied before connect() so the
+// kernel has it available for the first flight of data.
+//
+// The receive side deliberately differs by platform:
+//  * Windows honors SO_RCVBUF for the whole connection; 4 MiB keeps the
+//    advertised window large.
+//  * Linux disables receive-window autotuning as soon as SO_RCVBUF is set,
+//    and the request is capped by net.core.rmem_max (often only ~208 KiB).
+//    That pins the window below the bandwidth-delay product and makes the
+//    sender stall on every application pause. Leaving SO_RCVBUF alone lets
+//    Linux pick a window scale from tcp_rmem[2] and grow the window to several
+//    megabytes, which is what tools like rsync rely on.
+constexpr int kSocketBufferBytes = 4 * 1024 * 1024;
+
+void applySocketBuffers(Socket::Native native) {
+    int bufferSize = kSocketBufferBytes;
+#ifdef _WIN32
+    setsockopt(native, SOL_SOCKET, SO_SNDBUF,
+               reinterpret_cast<const char*>(&bufferSize), sizeof(bufferSize));
+    setsockopt(native, SOL_SOCKET, SO_RCVBUF,
+               reinterpret_cast<const char*>(&bufferSize), sizeof(bufferSize));
+#else
+    setsockopt(native, SOL_SOCKET, SO_SNDBUF, &bufferSize, sizeof(bufferSize));
+#endif
+}
 
 bool isWouldBlock(int code) {
 #ifdef _WIN32
@@ -154,6 +180,17 @@ void Socket::closeNative(Native native) {
 #endif
 }
 
+void Socket::shutdownBoth() {
+    if (socket_ == kInvalidSocket) {
+        return;
+    }
+#ifdef _WIN32
+    ::shutdown(socket_, SD_BOTH);
+#else
+    ::shutdown(socket_, SHUT_RDWR);
+#endif
+}
+
 void Socket::close() {
     if (socket_ != kInvalidSocket) {
         closeNative(socket_);
@@ -169,18 +206,11 @@ void Socket::configureConnectedSocket() {
                reinterpret_cast<const char*>(&enabled), sizeof(enabled));
     setsockopt(socket_, SOL_SOCKET, SO_KEEPALIVE,
                reinterpret_cast<const char*>(&enabled), sizeof(enabled));
-    const int bufferSize = kSocketBufferBytes;
-    setsockopt(socket_, SOL_SOCKET, SO_SNDBUF,
-               reinterpret_cast<const char*>(&bufferSize), sizeof(bufferSize));
-    setsockopt(socket_, SOL_SOCKET, SO_RCVBUF,
-               reinterpret_cast<const char*>(&bufferSize), sizeof(bufferSize));
 #else
     setsockopt(socket_, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
     setsockopt(socket_, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled));
-    int bufferSize = kSocketBufferBytes;
-    setsockopt(socket_, SOL_SOCKET, SO_SNDBUF, &bufferSize, sizeof(bufferSize));
-    setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, &bufferSize, sizeof(bufferSize));
 #endif
+    applySocketBuffers(socket_);
 }
 
 Socket::WaitStatus Socket::waitSocket(
@@ -313,6 +343,7 @@ bool Socket::connectTo(const std::string& host, uint16_t port, int timeoutMs,
             continue;
         }
         setNonBlocking(native);
+        applySocketBuffers(native);
         int result = ::connect(native, candidate->ai_addr,
                                static_cast<decltype(sizeof(sockaddr))>(
                                    candidate->ai_addrlen));
@@ -442,6 +473,132 @@ bool Socket::sendAll(const void* data, std::size_t size, int timeoutMs,
     return true;
 }
 
+bool Socket::sendAllVectored(const void* first, std::size_t firstSize,
+                             const void* second, std::size_t secondSize,
+                             int timeoutMs, const std::atomic<bool>* abort,
+                             std::string& error) {
+    if (!valid()) {
+        error = "套接字未连接";
+        return false;
+    }
+    const auto* firstBytes = static_cast<const std::uint8_t*>(first);
+    const auto* secondBytes = static_cast<const std::uint8_t*>(second);
+    std::size_t firstSent = 0;
+    std::size_t secondSent = 0;
+    const std::size_t total = firstSize + secondSize;
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(std::max(1, timeoutMs));
+    while (firstSent + secondSent < total) {
+        if (abort != nullptr && abort->load()) {
+            error = "操作已取消";
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline) {
+            error = "发送数据超时";
+            return false;
+        }
+        std::size_t sentNow = 0;
+        bool wouldBlock = false;
+#ifdef _WIN32
+        WSABUF buffers[2]{};
+        DWORD bufferCount = 0;
+        if (firstSent < firstSize) {
+            buffers[bufferCount].buf = reinterpret_cast<char*>(
+                const_cast<std::uint8_t*>(firstBytes + firstSent));
+            buffers[bufferCount].len = static_cast<ULONG>(
+                std::min<std::size_t>(firstSize - firstSent, INT_MAX));
+            ++bufferCount;
+        }
+        if (secondSent < secondSize) {
+            buffers[bufferCount].buf = reinterpret_cast<char*>(
+                const_cast<std::uint8_t*>(secondBytes + secondSent));
+            buffers[bufferCount].len = static_cast<ULONG>(
+                std::min<std::size_t>(secondSize - secondSent, INT_MAX));
+            ++bufferCount;
+        }
+        DWORD sent = 0;
+        const int result =
+            WSASend(socket_, buffers, bufferCount, &sent, 0, nullptr, nullptr);
+        if (result == 0) {
+            if (sent == 0) {
+                error = "网络发送返回 0 字节";
+                return false;
+            }
+            sentNow = static_cast<std::size_t>(sent);
+        } else {
+            const int code = lastSocketError();
+            if (isInterrupted(code)) {
+                continue;
+            }
+            if (isWouldBlock(code)) {
+                wouldBlock = true;
+            } else {
+                error = "发送数据失败: " + socketErrorText(code);
+                return false;
+            }
+        }
+#else
+        struct iovec iov[2]{};
+        int iovCount = 0;
+        if (firstSent < firstSize) {
+            iov[iovCount].iov_base =
+                const_cast<std::uint8_t*>(firstBytes + firstSent);
+            iov[iovCount].iov_len = firstSize - firstSent;
+            ++iovCount;
+        }
+        if (secondSent < secondSize) {
+            iov[iovCount].iov_base =
+                const_cast<std::uint8_t*>(secondBytes + secondSent);
+            iov[iovCount].iov_len = secondSize - secondSent;
+            ++iovCount;
+        }
+        struct msghdr message{};
+        message.msg_iov = iov;
+        message.msg_iovlen =
+            static_cast<decltype(message.msg_iovlen)>(iovCount);
+        const ssize_t result = sendmsg(socket_, &message, MSG_NOSIGNAL);
+        if (result > 0) {
+            sentNow = static_cast<std::size_t>(result);
+        } else if (result == 0) {
+            error = "网络发送返回 0 字节";
+            return false;
+        } else {
+            const int code = lastSocketError();
+            if (isInterrupted(code)) {
+                continue;
+            }
+            if (isWouldBlock(code)) {
+                wouldBlock = true;
+            } else {
+                error = "发送数据失败: " + socketErrorText(code);
+                return false;
+            }
+        }
+#endif
+        if (wouldBlock) {
+            std::string waitError;
+            const int remaining = static_cast<int>(
+                std::max<int64_t>(
+                    0, std::chrono::duration_cast<std::chrono::milliseconds>(
+                           deadline - std::chrono::steady_clock::now())
+                           .count()));
+            const WaitStatus status =
+                waitSocket(remaining, true, abort, waitError);
+            if (status == WaitStatus::Ready) {
+                continue;
+            }
+            error = waitError.empty() ? "网络发送超时" : waitError;
+            return false;
+        }
+        const std::size_t firstRemaining = firstSize - firstSent;
+        const std::size_t usedForFirst = std::min(sentNow, firstRemaining);
+        firstSent += usedForFirst;
+        secondSent += sentNow - usedForFirst;
+    }
+    return true;
+}
+
 bool Socket::recvAll(void* data, std::size_t size, int timeoutMs,
                      const std::atomic<bool>* abort, std::string& error) {
     if (!valid()) {
@@ -524,6 +681,10 @@ std::unique_ptr<Socket> Socket::createListener(uint16_t port,
 #else
     setsockopt(native, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled));
 #endif
+    // On Windows the listening socket's receive buffer is inherited by
+    // accepted connections. On Linux only the send buffer is touched; the
+    // receive window is left to kernel autotuning.
+    applySocketBuffers(native);
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = htonl(INADDR_ANY);

@@ -160,6 +160,20 @@ void sendOrThrow(Socket& socket, const void* data, std::size_t size,
     }
 }
 
+void sendOrThrowVectored(Socket& socket, const void* first,
+                         std::size_t firstSize, const void* second,
+                         std::size_t secondSize, int timeoutMs,
+                         const std::atomic<bool>* abort) {
+    std::string error;
+    if (!socket.sendAllVectored(first, firstSize, second, secondSize, timeoutMs,
+                                abort, error)) {
+        if (abort != nullptr && abort->load()) {
+            throw Error(ErrorKind::Cancelled, error);
+        }
+        throw Error(ErrorKind::Network, error);
+    }
+}
+
 }  // namespace
 
 TransferId makeTransferId() {
@@ -480,14 +494,21 @@ void Channel::send(MessageType type, const std::vector<uint8_t>& payload,
     header[9] = static_cast<uint8_t>(length >> 16);
     header[10] = static_cast<uint8_t>(length >> 8);
     header[11] = static_cast<uint8_t>(length);
-    sendOrThrow(socket_, header, sizeof(header), timeoutMs, abort_);
     if (!payload.empty()) {
-        sendOrThrow(socket_, payload.data(), payload.size(), timeoutMs,
-                    abort_);
+        sendOrThrowVectored(socket_, header, sizeof(header), payload.data(),
+                            payload.size(), timeoutMs, abort_);
+    } else {
+        sendOrThrow(socket_, header, sizeof(header), timeoutMs, abort_);
     }
 }
 
 Frame Channel::read(int timeoutMs) {
+    Frame frame;
+    readInto(frame, timeoutMs);
+    return frame;
+}
+
+void Channel::readInto(Frame& frame, int timeoutMs) {
     uint8_t header[kHeaderSize]{};
     std::string error;
     if (!socket_.recvAll(header, sizeof(header), timeoutMs, abort_, error)) {
@@ -517,7 +538,6 @@ Frame Channel::read(int timeoutMs) {
         type > static_cast<uint16_t>(MessageType::Pong)) {
         throw Error(ErrorKind::Protocol, "收到未知消息类型");
     }
-    Frame frame;
     frame.type = static_cast<MessageType>(type);
     frame.payload.resize(length);
     if (length != 0 &&
@@ -528,7 +548,6 @@ Frame Channel::read(int timeoutMs) {
         }
         throw Error(ErrorKind::Network, error);
     }
-    return frame;
 }
 
 }  // namespace proto

@@ -7,6 +7,7 @@
 #include <condition_variable>
 #include <cstring>
 #include <deque>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <set>
@@ -15,6 +16,11 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
+
+#ifndef _WIN32
+#include <locale.h>
+#include <wctype.h>
+#endif
 
 #include "common.h"
 #include "platform.h"
@@ -49,12 +55,156 @@ std::string sanitizePeerName(const std::string& name) {
     return truncateUtf8(trim(result), 120);
 }
 
-std::string normalizedRelativeKey(const std::string& relativePath) {
-#ifdef _WIN32
-    return caseFoldForPathComparison(relativePath);
-#else
-    return relativePath;
+#ifndef _WIN32
+void appendUtf8(std::string& out, uint32_t codePoint) {
+    if (codePoint <= 0x7f) {
+        out.push_back(static_cast<char>(codePoint));
+    } else if (codePoint <= 0x7ff) {
+        out.push_back(static_cast<char>(0xc0 | (codePoint >> 6)));
+        out.push_back(static_cast<char>(0x80 | (codePoint & 0x3f)));
+    } else if (codePoint <= 0xffff) {
+        out.push_back(static_cast<char>(0xe0 | (codePoint >> 12)));
+        out.push_back(
+            static_cast<char>(0x80 | ((codePoint >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (codePoint & 0x3f)));
+    } else {
+        out.push_back(static_cast<char>(0xf0 | (codePoint >> 18)));
+        out.push_back(
+            static_cast<char>(0x80 | ((codePoint >> 12) & 0x3f)));
+        out.push_back(
+            static_cast<char>(0x80 | ((codePoint >> 6) & 0x3f)));
+        out.push_back(static_cast<char>(0x80 | (codePoint & 0x3f)));
+    }
+}
+
+locale_t utf8CaseLocale() {
+    static locale_t locale = [] {
+        locale_t candidate =
+            newlocale(LC_CTYPE_MASK, "C.UTF-8", nullptr);
+        if (candidate == nullptr) {
+            candidate = newlocale(LC_CTYPE_MASK, "C.utf8", nullptr);
+        }
+        return candidate;
+    }();
+    return locale;
+}
+
+// Lower-cases valid UTF-8 with the C.UTF-8 tables. This is used only to decide
+// whether two manifest paths would alias on a case-insensitive destination,
+// never to rename anything. Invalid input falls back to ASCII folding.
+std::string foldUtf8Case(const std::string& value) {
+    const locale_t locale = utf8CaseLocale();
+    if (locale == nullptr) {
+        return toLowerAscii(value);
+    }
+    std::string result;
+    result.reserve(value.size());
+    std::size_t i = 0;
+    while (i < value.size()) {
+        const auto lead = static_cast<unsigned char>(value[i]);
+        uint32_t codePoint = 0;
+        std::size_t length = 0;
+        if (lead < 0x80) {
+            codePoint = lead;
+            length = 1;
+        } else if ((lead & 0xe0) == 0xc0) {
+            codePoint = lead & 0x1f;
+            length = 2;
+        } else if ((lead & 0xf0) == 0xe0) {
+            codePoint = lead & 0x0f;
+            length = 3;
+        } else if ((lead & 0xf8) == 0xf0) {
+            codePoint = lead & 0x07;
+            length = 4;
+        } else {
+            return toLowerAscii(value);
+        }
+        if (i + length > value.size()) {
+            return toLowerAscii(value);
+        }
+        for (std::size_t j = 1; j < length; ++j) {
+            const auto next = static_cast<unsigned char>(value[i + j]);
+            if ((next & 0xc0) != 0x80) {
+                return toLowerAscii(value);
+            }
+            codePoint = (codePoint << 6) | (next & 0x3f);
+        }
+        if (codePoint > 0x10ffff) {
+            return toLowerAscii(value);
+        }
+        const wint_t lowered =
+            towlower_l(static_cast<wint_t>(codePoint), locale);
+        appendUtf8(result, static_cast<uint32_t>(lowered));
+        i += length;
+    }
+    return result;
+}
 #endif
+
+std::string foldPathCase(const std::string& value) {
+#ifdef _WIN32
+    return caseFoldForPathComparison(value);
+#else
+    return foldUtf8Case(value);
+#endif
+}
+
+// The receive directory's filesystem decides whether names that differ only
+// by case are distinct. A probe (below) tells us which rule applies; on a
+// case-sensitive filesystem the paths stay exactly as sent, so a.txt and
+// A.txt are two independent files.
+std::string normalizedRelativeKey(const std::string& relativePath,
+                                  bool caseInsensitive) {
+    return caseInsensitive ? foldPathCase(relativePath) : relativePath;
+}
+
+// Writes a uniquely named probe file and checks whether its ASCII upper-case
+// spelling resolves to the same directory entry. True means the destination
+// cannot represent manifest paths that differ only by case; such a manifest
+// must be rejected rather than letting one entry replace another.
+bool receivePathIsCaseInsensitive(const fs::path& directory) {
+#ifdef _WIN32
+    (void)directory;
+    return true;
+#else
+    const fs::path probe =
+        directory / pathFromUtf8(".landrop-case-probe-" + randomHex(8));
+    std::string error;
+    FileWriter writer;
+    if (!writer.openAt(probe, 0, error)) {
+        // The receive directory is not writable; the transfer will fail
+        // later anyway. Treat it as case-insensitive so we never silently
+        // overwrite one manifest entry with another.
+        return true;
+    }
+    const char marker = 'x';
+    const bool written = writer.writeAll(&marker, 1, error);
+    writer.close();
+    bool insensitive = true;
+    if (written) {
+        std::string upper = pathToUtf8(probe.filename());
+        for (char& c : upper) {
+            if (c >= 'a' && c <= 'z') {
+                c = static_cast<char>(c - 'a' + 'A');
+            }
+        }
+        std::error_code ec;
+        const bool upperExists =
+            fs::exists(directory / pathFromUtf8(upper), ec);
+        insensitive = ec ? true : upperExists;
+    }
+    std::error_code removeError;
+    fs::remove(probe, removeError);
+    return insensitive;
+#endif
+}
+
+// Keys used for in-process path locks. Two connections writing case variants
+// to a case-insensitive destination must share a lock; on a case-sensitive
+// destination they are independent.
+std::string collisionKeyForPath(const fs::path& path, bool caseInsensitive) {
+    std::string key = pathToUtf8(path);
+    return caseInsensitive ? foldPathCase(key) : std::move(key);
 }
 
 std::string firstComponent(const std::string& relativePath) {
@@ -78,12 +228,20 @@ bool isMissingPathError(const std::error_code& error) {
 }
 
 void validateDestinationPath(const std::string& relativePath,
-                             std::string& message) {
+                             bool caseInsensitive, std::string& message) {
     if (!validateRelativePath(relativePath, message)) {
         return;
     }
-    if (toLowerAscii(firstComponent(relativePath)) ==
-        kStateDirectoryName) {
+    // The reserved cache directory can only be collided with when the
+    // destination filesystem ignores case. On a case-sensitive filesystem
+    // ".Landrop-Parts" is a separate, safely receivable directory; on
+    // Windows or a case-insensitive mount it must stay reserved.
+    const std::string first = firstComponent(relativePath);
+    const bool reserved =
+        caseInsensitive
+            ? foldPathCase(first) == foldPathCase(kStateDirectoryName)
+            : first == kStateDirectoryName;
+    if (reserved) {
         message = "该路径使用了 LanDrop 的保留名称";
         return;
     }
@@ -171,8 +329,17 @@ void writePartMeta(const fs::path& path, const Sha256::Digest& digest,
                                            (56 - static_cast<unsigned>(i) * 8));
     }
     std::memcpy(data.data() + 16, digest.data(), digest.size());
+    // This sidecar only accelerates resume. If a crash tears or loses it, the
+    // size/content check in readPartMeta fails and the part is discarded and
+    // re-sent; the final full-file SHA-256 still gates every rename. Writing
+    // it without an fsync or atomic replace therefore cannot weaken data
+    // integrity, and it removes a durable barrier that dominated the cost of
+    // transfers containing many small files.
+    FileWriter writer;
     std::string error;
-    if (!writeFileAtomic(path, data.data(), data.size(), error)) {
+    if (!writer.openAt(path, 0, error) ||
+        !writer.writeAll(data.data(), data.size(), error)) {
+        writer.close();
         throw Error(ErrorKind::LocalIo, error);
     }
 }
@@ -258,6 +425,154 @@ void removeTemporaryFile(const fs::path& path) {
         throw Error(ErrorKind::LocalIo, error);
     }
 }
+
+// Decouples reading from the socket from writing and hashing. A dedicated
+// reader keeps draining the TCP receive buffer while the worker thread writes
+// to disk and updates SHA-256; without this, every application pause fills the
+// kernel receive window and stalls the sender. The bounded queue provides
+// backpressure instead of unbounded memory growth.
+class FrameQueue {
+public:
+    FrameQueue(proto::Channel& channel, Socket& socket,
+               const std::atomic<bool>& stop)
+        : channel_(channel), socket_(socket), stop_(stop) {}
+
+    ~FrameQueue() { stopAndJoin(); }
+
+    void start() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (reader_.joinable()) {
+            return;
+        }
+        reader_ = std::thread([this]() { readerLoop(); });
+    }
+
+    proto::Frame pop(int timeoutMs) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        const auto deadline = std::chrono::steady_clock::now() +
+                              std::chrono::milliseconds(
+                                  std::max(1, timeoutMs));
+        for (;;) {
+            if (!queue_.empty()) {
+                proto::Frame frame = std::move(queue_.front());
+                queue_.pop_front();
+                queuedBytes_ -= frame.payload.size();
+                cv_.notify_all();
+                return frame;
+            }
+            if (error_ != nullptr) {
+                std::rethrow_exception(error_);
+            }
+            if (finished_) {
+                throw Error(ErrorKind::Network, "连接已被对端关闭");
+            }
+            if (stopping_ || stop_.load()) {
+                throw Error(ErrorKind::Cancelled, "接收已停止");
+            }
+            if (cv_.wait_until(lock, deadline) == std::cv_status::timeout &&
+                queue_.empty()) {
+                throw Error(ErrorKind::Timeout, "接收数据超时");
+            }
+        }
+    }
+
+    void stopAndJoin() {
+        bool needShutdown = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (joined_) {
+                return;
+            }
+            stopping_ = true;
+            needShutdown = !finished_;
+            cv_.notify_all();
+        }
+        if (needShutdown && reader_.joinable()) {
+            socket_.shutdownBoth();
+        }
+        if (reader_.joinable()) {
+            reader_.join();
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        joined_ = true;
+    }
+
+private:
+    static constexpr std::size_t kMaxQueuedBytes = 8u * 1024u * 1024u;
+
+    void readerLoop() {
+        try {
+            readerLoopImpl();
+        } catch (...) {
+            std::lock_guard<std::mutex> lock(mutex_);
+            error_ = std::current_exception();
+            finished_ = true;
+            cv_.notify_all();
+        }
+    }
+
+    void readerLoopImpl() {
+        for (;;) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (stopping_ || stop_.load()) {
+                    finished_ = true;
+                    cv_.notify_all();
+                    return;
+                }
+            }
+            proto::Frame frame;
+            try {
+                channel_.readInto(frame, proto::kIoTimeoutMs);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                error_ = std::current_exception();
+                finished_ = true;
+                cv_.notify_all();
+                return;
+            }
+            const bool last =
+                frame.type == proto::MessageType::Done ||
+                frame.type == proto::MessageType::Error ||
+                frame.type == proto::MessageType::Cancel;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                cv_.wait(lock, [this, &frame]() {
+                    return stopping_ || stop_.load() ||
+                           queuedBytes_ + frame.payload.size() <=
+                               kMaxQueuedBytes;
+                });
+                if (stopping_ || stop_.load()) {
+                    finished_ = true;
+                    cv_.notify_all();
+                    return;
+                }
+                queuedBytes_ += frame.payload.size();
+                queue_.push_back(std::move(frame));
+                cv_.notify_all();
+            }
+            if (last) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                finished_ = true;
+                cv_.notify_all();
+                return;
+            }
+        }
+    }
+
+    proto::Channel& channel_;
+    Socket& socket_;
+    const std::atomic<bool>& stop_;
+    std::thread reader_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::deque<proto::Frame> queue_;
+    std::size_t queuedBytes_ = 0;
+    bool stopping_ = false;
+    bool finished_ = false;
+    bool joined_ = false;
+    std::exception_ptr error_;
+};
 
 }  // namespace
 
@@ -477,6 +792,7 @@ private:
         std::string peerName = "未知设备";
         std::string peerDisplay =
             peerIp.empty() ? peerName : peerName + " (" + peerIp + ")";
+        std::unique_ptr<FrameQueue> frames;
 
         try {
             const proto::Frame helloFrame =
@@ -561,6 +877,10 @@ private:
                             "无法解析接收目录: " + pathToUtf8(root) + " — " +
                                 platform::errorCodeMessage(ec));
             }
+            // The destination's own filesystem decides whether case variants
+            // are distinct. Probe once per transfer; the probe file is
+            // removed immediately.
+            const bool caseInsensitive = receivePathIsCaseInsensitive(root);
 
             std::vector<proto::Entry> entries;
             entries.reserve(itemCount);
@@ -601,7 +921,8 @@ private:
                     throw Error(ErrorKind::Protocol, "未知的清单项目类型");
                 }
                 std::string pathError;
-                validateDestinationPath(entry.relativePath, pathError);
+                validateDestinationPath(entry.relativePath, caseInsensitive,
+                                        pathError);
                 if (!pathError.empty()) {
                     throw Error(ErrorKind::Rejected,
                                 "接收方拒绝路径 " + entry.relativePath + "：" +
@@ -660,7 +981,8 @@ private:
             pathKeys.reserve(entries.size());
             for (const auto& entry : entries) {
                 pathKeys.push_back(
-                    {normalizedRelativeKey(entry.relativePath),
+                    {normalizedRelativeKey(entry.relativePath,
+                                           caseInsensitive),
                      entry.kind == proto::EntryKind::File,
                      entry.relativePath});
             }
@@ -670,6 +992,16 @@ private:
                       });
             for (std::size_t i = 1; i < pathKeys.size(); ++i) {
                 if (pathKeys[i].key == pathKeys[i - 1].key) {
+                    if (caseInsensitive &&
+                        pathKeys[i].originalPath !=
+                            pathKeys[i - 1].originalPath) {
+                        throw Error(
+                            ErrorKind::Rejected,
+                            "接收目录所在文件系统不区分大小写，以下路径无法同时保存: " +
+                                pathKeys[i - 1].originalPath + " 与 " +
+                                pathKeys[i].originalPath +
+                                "；请重命名其中一个后重试");
+                    }
                     throw Error(ErrorKind::Rejected,
                                 "传输清单包含重复路径: " +
                                     pathKeys[i].originalPath);
@@ -749,7 +1081,8 @@ private:
             lockKeys.reserve(fileCount);
             for (std::size_t i = 0; i < entries.size(); ++i) {
                 if (entries[i].kind == proto::EntryKind::File) {
-                    lockKeys.push_back(pathCollisionKey(finalPaths[i]));
+                    lockKeys.push_back(
+                        collisionKeyForPath(finalPaths[i], caseInsensitive));
                 }
             }
             PathLockGuard pathGuard(*this, lockKeys);
@@ -946,7 +1279,8 @@ private:
                 if (entry.kind != proto::EntryKind::File) {
                     continue;
                 }
-                const std::string key = pathCollisionKey(finalPaths[i]);
+                const std::string key =
+                    collisionKeyForPath(finalPaths[i], caseInsensitive);
                 const Sha256::Digest pathDigest =
                     Sha256::hash(key.data(), key.size());
                 const std::string partName =
@@ -1042,6 +1376,9 @@ private:
                        "开始接收来自 " + peerDisplay + " 的 " +
                            std::to_string(fileCount) + " 个文件");
 
+            frames = std::make_unique<FrameQueue>(channel, *socket, stop_);
+            frames->start();
+
             uint64_t receivedThisSession = 0;
             auto lastUiUpdate = std::chrono::steady_clock::time_point{};
             auto updateProgress = [&](const fs::path& current, bool force) {
@@ -1061,6 +1398,9 @@ private:
                 });
             };
 
+            // Frames arrive from the reader thread; each payload stays alive
+            // until its write and hash for the frame are complete.
+            proto::Frame frame;
             for (std::size_t i = 0; i < entries.size(); ++i) {
                 if (entries[i].kind != proto::EntryKind::File) {
                     continue;
@@ -1072,25 +1412,25 @@ private:
                 const fs::path partPath = pathFromUtf8(partPaths[i]);
                 const fs::path metaPath = pathFromUtf8(metaPaths[i]);
 
-                proto::Frame beginFrame = channel.read(proto::kIoTimeoutMs);
-                while (beginFrame.type == proto::MessageType::Ping) {
+                frame = frames->pop(proto::kIoTimeoutMs);
+                while (frame.type == proto::MessageType::Ping) {
                     channel.send(proto::MessageType::Pong,
                                  proto::makePing(proto::parsePingPong(
-                                     beginFrame.payload)),
+                                     frame.payload)),
                                  proto::kIoTimeoutMs);
-                    beginFrame = channel.read(proto::kIoTimeoutMs);
+                    frame = frames->pop(proto::kIoTimeoutMs);
                 }
-                if (beginFrame.type == proto::MessageType::Error) {
-                    const auto remote = proto::parseError(beginFrame.payload);
+                if (frame.type == proto::MessageType::Error) {
+                    const auto remote = proto::parseError(frame.payload);
                     throw Error(ErrorKind::Rejected, remote.message);
                 }
-                if (beginFrame.type != proto::MessageType::FileBegin) {
+                if (frame.type != proto::MessageType::FileBegin) {
                     throw Error(ErrorKind::Protocol,
                                 "开始接收文件时收到意外消息");
                 }
                 uint32_t beginIndex = 0;
                 uint64_t beginOffset = 0;
-                proto::parseFileBegin(beginFrame.payload, beginIndex,
+                proto::parseFileBegin(frame.payload, beginIndex,
                                       beginOffset);
                 if (beginIndex != fileIndex || beginOffset != offset) {
                     throw Error(ErrorKind::Protocol, "文件续传位置不一致");
@@ -1135,7 +1475,7 @@ private:
                     if (stop_.load()) {
                         throw Error(ErrorKind::Cancelled, "接收已停止");
                     }
-                    const proto::Frame frame = channel.read(proto::kIoTimeoutMs);
+                    frame = frames->pop(proto::kIoTimeoutMs);
                     if (frame.type == proto::MessageType::FileData) {
                         uint32_t dataIndex = 0;
                         const uint8_t* data = nullptr;
@@ -1339,26 +1679,27 @@ private:
                 updateProgress(finalPaths[i], true);
             }
 
-            proto::Frame doneFrame = channel.read(proto::kIoTimeoutMs);
-            while (doneFrame.type == proto::MessageType::Ping) {
+            frame = frames->pop(proto::kIoTimeoutMs);
+            while (frame.type == proto::MessageType::Ping) {
                 channel.send(proto::MessageType::Pong,
                              proto::makePing(proto::parsePingPong(
-                                 doneFrame.payload)),
+                                 frame.payload)),
                              proto::kIoTimeoutMs);
-                doneFrame = channel.read(proto::kIoTimeoutMs);
+                frame = frames->pop(proto::kIoTimeoutMs);
             }
-            if (doneFrame.type != proto::MessageType::Done) {
+            if (frame.type != proto::MessageType::Done) {
                 throw Error(ErrorKind::Protocol, "缺少传输完成消息");
             }
             uint64_t doneTotal = 0;
             uint32_t doneFiles = 0;
-            proto::parseDone(doneFrame.payload, doneTotal, doneFiles);
+            proto::parseDone(frame.payload, doneTotal, doneFiles);
             if (doneTotal != start.totalBytes || doneFiles != start.fileCount) {
                 throw Error(ErrorKind::Protocol, "传输完成统计不一致");
             }
             channel.send(proto::MessageType::DoneAck,
                          proto::makeDoneAck("接收完成"),
                          proto::kHandshakeTimeoutMs);
+            frames->stopAndJoin();
             state_.updateJob(jobId, [&](JobRecord& job) {
                 job.bytesDone = start.totalBytes;
                 job.currentFile.clear();

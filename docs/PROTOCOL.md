@@ -30,6 +30,13 @@ length followed by UTF-8 bytes. Relative paths use `/`, are at most 4096 bytes,
 and may not be absolute, contain empty components, `.`/`..`, backslashes, or
 control characters.
 
+Path case is significant on the wire and is preserved exactly. A receiver on a
+case-sensitive filesystem (for example Linux/ext4) stores `Report.txt` and
+`report.txt` as two independent files. A receiver on a case-insensitive
+filesystem (Windows, or a case-insensitive mount) probes the destination and
+rejects a manifest that contains paths differing only by case, rather than
+letting one entry overwrite another.
+
 The default data payload is 256 KiB plus the four-byte file index. Relative
 paths are validated again on the receiving side before any write.
 
