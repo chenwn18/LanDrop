@@ -1,0 +1,74 @@
+ifeq ($(OS),Windows_NT)
+SHELL := cmd.exe
+.SHELLFLAGS := /c
+endif
+# LanDrop - Windows build (MinGW-w64, tested with i686 GCC 16.2.0)
+#
+# Typical use:
+#   set PATH=D:\software\mingw32\bin;%PATH%
+#   mingw32-make -f Makefile.win
+#
+# 64-bit builds work with the same command when a 64-bit MinGW toolchain is
+# first in PATH.
+
+CXX ?= g++
+WINDRES ?= windres
+TARGET := build/LanDrop.exe
+TEST_TARGET := build/LanDropTests.exe
+RESOURCE_OBJ := build/win/app_res.o
+
+CPPFLAGS := -Isrc -Iresources -DUNICODE -D_UNICODE -D_WIN32_WINNT=0x0601 -DNDEBUG
+CXXFLAGS := -std=c++17 -O3 -ffunction-sections -fdata-sections -Wall -Wextra
+LDFLAGS_GUI := -mwindows -municode -static -static-libgcc -static-libstdc++ \
+               -Wl,--gc-sections -s
+LDFLAGS_TEST := -static -static-libgcc -static-libstdc++ -s
+LIBS := -lcomctl32 -lcomdlg32 -lws2_32 -liphlpapi -lshell32 -lole32 -luuid \
+        -luser32 -lgdi32 -ladvapi32
+
+CORE_SOURCES := \
+	src/core/sha256.cpp \
+	src/core/util.cpp \
+	src/core/protocol.cpp \
+	src/core/socket.cpp \
+	src/core/scanner.cpp \
+	src/core/sender.cpp \
+	src/core/receiver.cpp \
+	src/core/discovery.cpp \
+	src/core/settings.cpp \
+	src/core/state.cpp \
+	src/core/app_controller.cpp \
+	src/platform/file_io.cpp \
+	src/platform/platform_win.cpp
+
+APP_SOURCES := $(CORE_SOURCES) src/ui/ui_win.cpp src/main.cpp
+TEST_SOURCES := $(CORE_SOURCES) tests/test_core.cpp
+HEADERS := $(wildcard src/*.h src/core/*.h src/platform/*.h src/ui/*.h) \
+           resources/resource.h
+
+.PHONY: all test clean run directories
+
+all: $(TARGET)
+
+$(TARGET): $(APP_SOURCES) $(HEADERS) $(RESOURCE_OBJ) | directories
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(APP_SOURCES) $(RESOURCE_OBJ) \
+		-o $(TARGET) $(LDFLAGS_GUI) $(LIBS)
+
+$(TEST_TARGET): $(TEST_SOURCES) $(HEADERS) | directories
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) $(TEST_SOURCES) \
+		-o $(TEST_TARGET) $(LDFLAGS_TEST) $(LIBS)
+
+$(RESOURCE_OBJ): resources/app.rc resources/app.manifest resources/app.ico resources/resource.h | directories
+	cd resources && $(WINDRES) -I. -I../src app.rc -o ../$(RESOURCE_OBJ)
+
+directories:
+	@if not exist build mkdir build
+	@if not exist build\win mkdir build\win
+
+test: $(TEST_TARGET)
+	.\build\LanDropTests.exe
+
+run: $(TARGET)
+	.\build\LanDrop.exe
+
+clean:
+	@if exist build rmdir /s /q build

@@ -1,0 +1,39 @@
+# Build outputs
+/build/
+/bin/
+/dist/
+/out/
+*.o
+*.obj
+*.a
+*.lib
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+*.map
+*.dSYM/
+*.gcda
+*.gcno
+compile_commands.json
+.cache/
+
+# Runtime artifacts
+*.log
+*.part
+*.part.meta
+.landrop-parts/
+
+# IDE / editor
+.vscode/
+.idea/
+*.swp
+*~
+*.user
+*.suo
+
+# OS metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
